@@ -27,7 +27,7 @@ int main()
 			<< ": Elapsed = "
 			<< fmt_ms(duration.count())
 			<< ", Mnps: "
-			<< std::format("{:8.2f}", mnps)
+			<< std::format("{:6.2f}", mnps)
 			<< ", nodes: "
 			<< nodes
 			<< std::endl;
