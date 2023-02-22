@@ -1,9 +1,8 @@
-#include "chesstypes.h"
-#include "square.h"
+#include "chess.h"
 
 namespace chess
 {
-	square::square(const color color, const piece piece)
+	square::square(const chess::color color, const chess::piece piece)
 	{
 		if (color == color_none || piece == piece_none)
 		{
@@ -25,7 +24,7 @@ namespace chess
 		return *this;
 	}
 
-	const square& square::set(const color color, const piece piece)
+	const square& square::set(const chess::color color, const chess::piece piece)
 	{
 		assert(color != color_none && piece != piece_none);
 		fields.occupied = 1;

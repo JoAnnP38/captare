@@ -1,13 +1,11 @@
-#include "position.h"
+#include "chess.h"
 
 namespace chess
 {
-	position::position()
+	#pragma region position_state
+
+	position::position_state::position_state()
 	{
-		std::memset(board, 0, board_size * sizeof(square));
-		std::memset(pieces, 0, static_cast<size_t>(max_colors) * max_pieces * sizeof(bitboard));
-		std::memset(units, 0, max_colors * sizeof(bitboard));
-		all = 0;
 		side_to_move = color_none;
 		castling = no_rights;
 		enpassant = index_none;
@@ -16,4 +14,2464 @@ namespace chess
 		full_move_counter = 0;
 		hash = 0;
 	}
+
+	position::position_state::position_state(const position& p, const chess::move m)
+	{
+		move = m;
+		side_to_move = p._side_to_move;
+		castling = p._castling;
+		enpassant = p._enpassant;
+		enpassant_validated = p._enpassant_validated;
+		half_move_clock = p._half_move_clock;
+		full_move_counter = p._full_move_counter;
+		hash = p._hash;
+	}
+
+	void position::position_state::restore(position& p) const
+	{
+		p._side_to_move = side_to_move;
+		p._castling = castling;
+		p._enpassant = enpassant;
+		p._enpassant_validated = enpassant_validated;
+		p._half_move_clock = half_move_clock;
+		p._full_move_counter = full_move_counter;
+		p._hash = hash;
+	}
+
+	#pragma endregion
+
+	#pragma region constructors
+
+	position::position()
+	{
+		_history.reserve(max_game_length);
+		clear();
+	}
+
+	position::position(const position& other)
+	{
+		_history.reserve(max_game_length);
+		_board.fill(square::empty);
+		std::memcpy(_pieces, other._pieces, sizeof(bitboard) * max_colors * max_pieces);
+		std::memcpy(_units, other._units, sizeof(bitboard) * max_colors);
+		_all = other._all;
+		_side_to_move = other._side_to_move;
+		_castling = other._castling;
+		_enpassant = other._enpassant;
+		_enpassant_validated = other._enpassant_validated;
+		_half_move_clock = other._half_move_clock;
+		_full_move_counter = other._full_move_counter;
+		_hash = other._hash;
+		_history.assign(other._history.begin(), other._history.end());
+	}
+
+	position::position(const char* fen_string) : position()
+	{
+		if (!load_fen(fen_string))
+		{
+			throw std::exception{ "Invalid FEN position specified." };
+		}
+	}
+
+	#pragma endregion
+
+	void position::clear()
+	{
+		_board.fill(square::empty);
+		std::memset(_pieces, 0, sizeof(bitboard) * max_colors * max_pieces);
+		std::memset(_units, 0, sizeof(bitboard) * max_colors);
+		_all = 0;
+		_side_to_move = color_none;
+		_castling = no_rights;
+		_enpassant = index_none;
+		_enpassant_validated = index_none;
+		_half_move_clock = 0;
+		_full_move_counter = 0;
+		_hash = 0;
+		_history.clear();
+	}
+
+	#pragma region make / unmake move
+
+	bool position::make_move(const move& mv)
+	{
+		save_state(mv);
+		if (_enpassant_validated != index_none)
+		{
+			_hash.hash_ep(_enpassant_validated);
+		}
+		_enpassant = index_none;
+		_enpassant_validated = index_none;
+		_hash.hash_castling(_castling);
+
+		const index from = mv.from();
+		const index to = mv.to();
+		const piece pc = mv.get_piece();
+		const piece capture_pc = mv.capture();
+		const piece promote_pc = mv.promote();
+		const castling_info* ci = nullptr;
+
+		switch (mv.type())
+		{
+			case normal:
+				update_piece(_side_to_move, pc, from, to);
+				update_castling(from, to);
+				++_half_move_clock;
+				break;
+
+			case capture:
+				remove_piece(~_side_to_move, capture_pc, to);
+				update_piece(_side_to_move, pc, from, to);
+				update_castling(from, to);
+				_half_move_clock = 0;
+				break;
+
+			case castle:
+				ci = lookup_castling_info(to);
+				if (is_square_attacked_by(from, ~_side_to_move) || 
+					is_square_attacked_by(ci->king_move_thru, ~_side_to_move))
+				{
+					restore_state();
+					return false;
+				}
+
+				update_piece(_side_to_move, king, from, to);
+				update_piece(_side_to_move, rook, ci->rook_from, ci->rook_to);
+				update_castling(from, to);
+				++_half_move_clock;
+				break;
+
+			case move_type::enpassant:
+				remove_piece(~_side_to_move, capture_pc, static_cast<index>(to + ep_offset[_side_to_move]));
+				update_piece(_side_to_move, pc, from, to);
+				_half_move_clock = 0;
+				break;
+
+			case pawn_move:
+				update_piece(_side_to_move, pawn, from, to);
+				_half_move_clock = 0;
+				break;
+
+			case dbl_pawn_move:
+				update_piece(_side_to_move, pawn, from, to);
+				_enpassant = static_cast<index>(to + ep_offset[_side_to_move]);
+				if (is_ep_valid(~_side_to_move))
+				{
+					_enpassant_validated = _enpassant;
+					_hash.hash_ep(_enpassant_validated);
+				}
+				_half_move_clock = 0;
+				break;
+
+			case promote:
+				remove_piece(_side_to_move, pc, from);
+				add_piece(_side_to_move, promote_pc, to);
+				_half_move_clock = 0;
+				break;
+
+			case promote_capture:
+				remove_piece(~_side_to_move, capture_pc, to);
+				remove_piece(_side_to_move, pc, from);
+				add_piece(_side_to_move, promote_pc, to);
+				update_castling(from, to);
+				_half_move_clock = 0;
+				break;
+
+			case null_move:
+				// do nothing
+				break;
+
+			default:  // NOLINT(clang-diagnostic-covered-switch-default)
+				throw std::out_of_range{ "Invalid move type encountered in make_move." };
+		}
+		_full_move_counter += _side_to_move == black ? 1 : 0;
+		_hash.hash_castling(_castling);
+		_hash.hash_turn(_side_to_move);
+		_side_to_move = ~_side_to_move;
+		_hash.hash_turn(_side_to_move);
+
+		if (is_checked(_side_to_move))
+		{
+			unmake_move();
+			return false;
+		}
+		return true;
+	}
+
+	void position::unmake_move()
+	{
+		_side_to_move = ~_side_to_move;
+		const move& mv = last_move();
+		const index from = mv.from();
+		const index to = mv.to();
+		const piece pc = mv.get_piece();
+		const piece capture_pc = mv.capture();
+		const piece promote_pc = mv.promote();
+		const castling_info* ci = nullptr;
+
+		switch (mv.type())
+		{
+			case normal:
+			case pawn_move:
+			case dbl_pawn_move:
+				update_piece(_side_to_move, pc, to, from);
+				break;
+
+			case capture:
+				update_piece(_side_to_move, pc, to, from);
+				add_piece(~_side_to_move, capture_pc, to);
+				break;
+
+			case castle:
+				ci = lookup_castling_info(to);
+				update_piece(_side_to_move, rook, ci->rook_to, ci->rook_from);
+				update_piece(_side_to_move, king, to, from);
+				break;
+
+			case move_type::enpassant:
+				update_piece(_side_to_move, pawn, to, from);
+				add_piece(~_side_to_move, capture_pc, static_cast<index>(to + ep_offset[_side_to_move]));
+				break;
+
+			case promote:
+				remove_piece(_side_to_move, promote_pc, to);
+				add_piece(_side_to_move, pawn, from);
+				break;
+
+			case promote_capture:
+				remove_piece(_side_to_move, promote_pc, to);
+				add_piece(_side_to_move, pawn, from);
+				add_piece(~_side_to_move, capture_pc, to);
+				break;
+
+			case null_move:
+				// do nothing
+				break;
+
+			default:  // NOLINT(clang-diagnostic-covered-switch-default)
+				throw std::out_of_range{ "Invalid move type encountered in unmake_move." };
+		}
+
+		restore_state();
+	}
+
+	void position::save_state(const move& mv)
+	{
+		_history.emplace_back(*this, mv);
+	}
+
+	void position::restore_state()
+	{
+		_history.rbegin()->restore(*this);
+		_history.pop_back();
+	}
+
+	bool position::is_square_attacked_by(const index sq, const color by) const
+	{
+		return
+			(pawn_defends[by][sq] & _pieces[by][pawn]) != 0 ||
+			(piece_moves[knight][sq] & _pieces[by][knight]) != 0 ||
+			(piece_moves[king][sq] & _pieces[by][king]) != 0 ||
+			(get_piece_moves<rook>(sq) & (_pieces[by][rook] | _pieces[by][queen])) != 0 ||
+			(get_piece_moves<bishop>(sq) & (_pieces[by][bishop] | _pieces[by][queen])) != 0;
+	}
+
+	const position::castling_info* position::lookup_castling_info(index king_to)
+	{
+		const castling_info* ci = nullptr;
+		for (int i = 0; i < 4 && ci == nullptr; ++i)
+		{
+			if (castling_information[i].king_to == king_to)
+			{
+				ci = castling_information + i;
+			}
+		}
+		return ci;
+	}
+
+
+	#pragma endregion
+
+	#pragma region move generation
+
+	void position::generate_ep(move_vector& moves) const
+	{
+		if (_enpassant_validated != index_none)
+		{
+			bitboard bb = pawn_defends[_side_to_move][_enpassant_validated] & _pieces[_side_to_move][pawn];
+			for (; bb; bb = bitops::reset_lsb(bb))
+			{
+				const auto from = static_cast<index>(bitops::tz_count(bb));
+				moves.emplace_back(pawn, from, _enpassant_validated, move_type::enpassant, pawn);
+			}
+		}
+	}
+
+	void position::add_pawn_move(move_vector& moves, const index from, const index to, move_type flags, const piece capture)
+	{
+		const coord rank = index_to_rank(to);
+		if (rank == coord_min_value || rank == coord_max_value)
+		{
+			flags = flags == move_type::capture ? promote_capture : promote;
+			for (piece pc = knight; pc <= queen; ++pc)
+			{
+				moves.emplace_back(pawn, from, to, flags, capture, pc);
+			}
+		}
+		else
+		{
+			moves.emplace_back(pawn, from, to, flags, capture);
+		}
+	}
+
+	// traditional diagonal slider move resolution
+	bitboard position::get_bishop_attacks(const index from, const bitboard blockers)
+	{
+		const ray r = rays[from];
+		const bitboard bb = 
+			(r.north_east & ~rays[bitops::tz_count(r.north_east & blockers)].north_east) |
+			(r.north_west & ~rays[bitops::tz_count(r.north_west & blockers)].north_west) |
+			(r.south_east & ~revs[bitops::lz_count(r.south_east & blockers)].south_east) |
+			(r.south_west & ~revs[bitops::lz_count(r.south_west & blockers)].south_west);
+		return bb;
+	}
+
+	// traditional orthogonal slider move resolution
+	bitboard position::get_rook_attacks(const index from, const bitboard blockers)
+	{
+		const ray r = rays[from];
+		const bitboard bb =
+			(r.north & ~rays[bitops::tz_count(r.north & blockers)].north) |
+			(r.east & ~rays[bitops::tz_count(r.east & blockers)].east) |
+			(r.south & ~revs[bitops::lz_count(r.south & blockers)].south) |
+			(r.west & ~revs[bitops::lz_count(r.west & blockers)].west);
+		return bb;
+	}
+
+	#pragma endregion
+
+	#pragma region miscellaneous
+
+	bool position::reps2(uint64_t hash) const
+	{
+		int matches = 0, reversible = _half_move_clock - 2;
+		for(auto iter = _history.rbegin() + 2; 
+			reversible > 0 && matches < 2 &&
+			iter != _history.rend(); iter += 2, reversible -= 2)
+		{
+			if (iter->hash == hash)
+			{
+				++matches;
+			}
+		}
+
+		return matches == 2;
+	}
+
+	std::vector<move> position::moves_played() const
+	{
+		std::vector<move> moves{};
+		moves.reserve(_history.size());
+
+		for (auto& pos_state : _history)
+		{
+			moves.push_back(pos_state.move);
+		}
+		return moves;
+	}
+
+	bool position::insufficient_material() const
+	{
+		return bitops::pop_count(_pieces[white][pawn] | _pieces[black][pawn]) == 0 &&
+			   bitops::pop_count(_pieces[white][knight] | _pieces[white][bishop]) <= 1 &&
+			   bitops::pop_count(_pieces[black][knight] | _pieces[black][bishop]) <= 1 &&
+			   bitops::pop_count(_pieces[white][rook] | _pieces[white][queen]) == 0 &&
+			   bitops::pop_count(_pieces[black][rook] | _pieces[black][queen]) == 0;
+	}
+
+	position position::clone() const
+	{
+		return position{ *this };
+	}
+
+	const move& position::last_move() const
+	{
+		if (!_history.empty())
+		{
+			return _history.back().move;
+		}
+		return move::empty;
+	}
+
+	std::string position::to_string() const
+	{
+		std::string output{};
+		for (coord rank = coord_max_value; rank >= coord_min_value; --rank)
+		{
+			for (coord file = coord_min_value; file <= coord_max_value; ++file)
+			{
+				square sq = board(coord_to_index(file, rank));
+				if (!sq.occupied())
+				{
+					output.push_back('.');
+				}
+				else
+				{
+					output.push_back(notation::piece_char_map[sq.color()][sq.piece()]);
+				}
+				output.push_back(' ');
+			}
+			output.push_back('\n');
+		}
+		return output;
+	}
+
+	#pragma endregion
+
+	#pragma region fen processing
+
+	std::string position::to_fen() const
+	{
+		const notation fen_string{ *this };
+		return fen_string.to_string();
+	}
+
+	bool position::load_fen(const char* fen_string)
+	{
+		notation fen;
+		if (notation::try_parse(std::string{ fen_string }, fen))
+		{
+			clear();
+			for (int8_t i = a1; i <= h8; ++i)
+			{
+				const auto idx = static_cast<index>(i);
+				const square& sq = fen.squares(idx);
+				if (sq.occupied())
+				{
+					add_piece(sq.color(), sq.piece(), idx);
+				}
+			}
+			_side_to_move = fen.side_to_move();
+			_hash.hash_turn(_side_to_move);
+
+			_castling = fen.castling();
+			_hash.hash_castling(_castling);
+
+			_enpassant_validated = index_none;
+			_enpassant = fen.ep();
+			if (is_ep_valid(_side_to_move))
+			{
+				_enpassant_validated = _enpassant;
+				_hash.hash_ep(_enpassant_validated);
+			}
+
+			_half_move_clock = fen.half_move_clock();
+			_full_move_counter = fen.full_move_counter();
+			return true;
+		}
+
+		return false;
+	}
+
+	#pragma endregion
+
+	#pragma region incremental board updates
+
+	void position::add_piece(const color c, const piece p, const index i)
+	{
+		_hash.hash_piece(c, p, i);
+		_board[i].set(c, p);
+		_pieces[c][p] = bitops::set_bit(_pieces[c][p], i);
+		_units[c] = bitops::set_bit(_units[c], i);
+		_all = bitops::set_bit(_all, i);
+	}
+
+	void position::remove_piece(const color c, const piece p, const index i)
+	{
+		_hash.hash_piece(c, p, i);
+		_board[i].clear();
+		_pieces[c][p] = bitops::reset_bit(_pieces[c][p], i);
+		_units[c] = bitops::reset_bit(_units[c], i);
+		_all = bitops::reset_bit(_all, i);
+	}
+
+	#pragma endregion
+
+	#pragma region static tables
+
+	bitboard position::calc_bishop_attacks(const coord file, const coord rank)
+	{
+		bitboard attacks = 0;
+
+		for (coord r = rank + 1, f = file + 1; r <= 6 && f <= 6; ++r, ++f)
+		{
+			attacks |= bitops::get_mask(coord_to_index(f, r));
+		}
+		for (coord r = rank - 1, f = file + 1; r >= 1 && f <= 6; --r, ++f)
+		{
+			attacks |= bitops::get_mask(coord_to_index(f, r));
+		}
+		for (coord r = rank + 1, f = file - 1; r <= 6 && f >= 1; ++r, --f)
+		{
+			attacks |= bitops::get_mask(coord_to_index(f, r));
+		}
+		for (coord r = rank - 1, f = file - 1; r >= 1 && f >= 1; --r, --f)
+		{
+			attacks |= bitops::get_mask(coord_to_index(f, r));
+		}
+
+		return attacks;
+	}
+
+	bitboard position::calc_rook_attacks(const coord file, const coord rank)
+	{
+		bitboard attacks = 0;
+
+		for (coord r = rank + 1; r <= 6; ++r)
+		{
+			attacks |= bitops::get_mask(coord_to_index(file, r));
+		}
+		for (coord r = rank - 1; r >= 1; --r)
+		{
+			attacks |= bitops::get_mask(coord_to_index(file, r));
+		}
+		for (coord f = file + 1; f <= 6; ++f)
+		{
+			attacks |= bitops::get_mask(coord_to_index(f, rank));
+		}
+		for (coord f = file - 1; f >= 1; --f)
+		{
+			attacks |= bitops::get_mask(coord_to_index(f, rank));
+		}
+
+		return attacks;
+	}
+
+	void position::init_magics()
+	{
+		for (coord file = 0; file <= coord_max_value; ++file)
+		{
+			for (coord rank = 0; rank <= coord_max_value; ++rank)
+			{
+				const index sq = coord_to_index(file, rank);
+				const bitboard bishop_mask = calc_bishop_attacks(file, rank);
+				const bitboard rook_mask = calc_rook_attacks(file, rank);
+
+				auto bits = static_cast<index>(bitops::pop_count(bishop_mask));
+				for (bitboard i = 0; i < bitops::get_mask(bits); ++i)
+				{
+					const bitboard blockers = _pdep_u64(i, bishop_mask);
+					magic_lookup[bishop_index(sq, blockers)] = get_bishop_attacks(sq, blockers);
+				}
+
+				bits = static_cast<index>(bitops::pop_count(rook_mask));
+				for (bitboard i = 0; i < bitops::get_mask(bits); ++i)
+				{
+					const bitboard blockers = _pdep_u64(i, rook_mask);
+					magic_lookup[rook_index(sq, blockers)] = get_rook_attacks(sq, blockers);
+				}
+
+			}
+		}
+	}
+
+	const bitboard position::pawn_defends[max_colors][max_indices] =
+	{
+		#pragma region pawn_defends data
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000002ULL, 0x0000000000000005ULL, 0x000000000000000AULL, 0x0000000000000014ULL,
+			0x0000000000000028ULL, 0x0000000000000050ULL, 0x00000000000000A0ULL, 0x0000000000000040ULL,
+			0x0000000000000200ULL, 0x0000000000000500ULL, 0x0000000000000A00ULL, 0x0000000000001400ULL,
+			0x0000000000002800ULL, 0x0000000000005000ULL, 0x000000000000A000ULL, 0x0000000000004000ULL,
+			0x0000000000020000ULL, 0x0000000000050000ULL, 0x00000000000A0000ULL, 0x0000000000140000ULL,
+			0x0000000000280000ULL, 0x0000000000500000ULL, 0x0000000000A00000ULL, 0x0000000000400000ULL,
+			0x0000000002000000ULL, 0x0000000005000000ULL, 0x000000000A000000ULL, 0x0000000014000000ULL,
+			0x0000000028000000ULL, 0x0000000050000000ULL, 0x00000000A0000000ULL, 0x0000000040000000ULL,
+			0x0000000200000000ULL, 0x0000000500000000ULL, 0x0000000A00000000ULL, 0x0000001400000000ULL,
+			0x0000002800000000ULL, 0x0000005000000000ULL, 0x000000A000000000ULL, 0x0000004000000000ULL,
+			0x0000020000000000ULL, 0x0000050000000000ULL, 0x00000A0000000000ULL, 0x0000140000000000ULL,
+			0x0000280000000000ULL, 0x0000500000000000ULL, 0x0000A00000000000ULL, 0x0000400000000000ULL,
+			0x0002000000000000ULL, 0x0005000000000000ULL, 0x000A000000000000ULL, 0x0014000000000000ULL,
+			0x0028000000000000ULL, 0x0050000000000000ULL, 0x00A0000000000000ULL, 0x0040000000000000ULL
+		},
+		{
+			0x0000000000000200ULL, 0x0000000000000500ULL, 0x0000000000000A00ULL, 0x0000000000001400ULL,
+			0x0000000000002800ULL, 0x0000000000005000ULL, 0x000000000000A000ULL, 0x0000000000004000ULL,
+			0x0000000000020000ULL, 0x0000000000050000ULL, 0x00000000000A0000ULL, 0x0000000000140000ULL,
+			0x0000000000280000ULL, 0x0000000000500000ULL, 0x0000000000A00000ULL, 0x0000000000400000ULL,
+			0x0000000002000000ULL, 0x0000000005000000ULL, 0x000000000A000000ULL, 0x0000000014000000ULL,
+			0x0000000028000000ULL, 0x0000000050000000ULL, 0x00000000A0000000ULL, 0x0000000040000000ULL,
+			0x0000000200000000ULL, 0x0000000500000000ULL, 0x0000000A00000000ULL, 0x0000001400000000ULL,
+			0x0000002800000000ULL, 0x0000005000000000ULL, 0x000000A000000000ULL, 0x0000004000000000ULL,
+			0x0000020000000000ULL, 0x0000050000000000ULL, 0x00000A0000000000ULL, 0x0000140000000000ULL,
+			0x0000280000000000ULL, 0x0000500000000000ULL, 0x0000A00000000000ULL, 0x0000400000000000ULL,
+			0x0002000000000000ULL, 0x0005000000000000ULL, 0x000A000000000000ULL, 0x0014000000000000ULL,
+			0x0028000000000000ULL, 0x0050000000000000ULL, 0x00A0000000000000ULL, 0x0040000000000000ULL,
+			0x0200000000000000ULL, 0x0500000000000000ULL, 0x0A00000000000000ULL, 0x1400000000000000ULL,
+			0x2800000000000000ULL, 0x5000000000000000ULL, 0xA000000000000000ULL, 0x4000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL
+		}
+		#pragma endregion
+	};
+
+	const bitboard position::piece_moves[max_pieces][max_indices] =
+	{
+		#pragma region piece_moves data
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000020400ULL, 0x0000000000050800ULL, 0x00000000000A1100ULL, 0x0000000000142200ULL,
+			0x0000000000284400ULL, 0x0000000000508800ULL, 0x0000000000A01000ULL, 0x0000000000402000ULL,
+			0x0000000002040004ULL, 0x0000000005080008ULL, 0x000000000A110011ULL, 0x0000000014220022ULL,
+			0x0000000028440044ULL, 0x0000000050880088ULL, 0x00000000A0100010ULL, 0x0000000040200020ULL,
+			0x0000000204000402ULL, 0x0000000508000805ULL, 0x0000000A1100110AULL, 0x0000001422002214ULL,
+			0x0000002844004428ULL, 0x0000005088008850ULL, 0x000000A0100010A0ULL, 0x0000004020002040ULL,
+			0x0000020400040200ULL, 0x0000050800080500ULL, 0x00000A1100110A00ULL, 0x0000142200221400ULL,
+			0x0000284400442800ULL, 0x0000508800885000ULL, 0x0000A0100010A000ULL, 0x0000402000204000ULL,
+			0x0002040004020000ULL, 0x0005080008050000ULL, 0x000A1100110A0000ULL, 0x0014220022140000ULL,
+			0x0028440044280000ULL, 0x0050880088500000ULL, 0x00A0100010A00000ULL, 0x0040200020400000ULL,
+			0x0204000402000000ULL, 0x0508000805000000ULL, 0x0A1100110A000000ULL, 0x1422002214000000ULL,
+			0x2844004428000000ULL, 0x5088008850000000ULL, 0xA0100010A0000000ULL, 0x4020002040000000ULL,
+			0x0400040200000000ULL, 0x0800080500000000ULL, 0x1100110A00000000ULL, 0x2200221400000000ULL,
+			0x4400442800000000ULL, 0x8800885000000000ULL, 0x100010A000000000ULL, 0x2000204000000000ULL,
+			0x0004020000000000ULL, 0x0008050000000000ULL, 0x00110A0000000000ULL, 0x0022140000000000ULL,
+			0x0044280000000000ULL, 0x0088500000000000ULL, 0x0010A00000000000ULL, 0x0020400000000000ULL,
+		},
+		{
+			0x8040201008040200ULL, 0x0080402010080500ULL, 0x0000804020110A00ULL, 0x0000008041221400ULL,
+			0x0000000182442800ULL, 0x0000010204885000ULL, 0x000102040810A000ULL, 0x0102040810204000ULL,
+			0x4020100804020002ULL, 0x8040201008050005ULL, 0x00804020110A000AULL, 0x0000804122140014ULL,
+			0x0000018244280028ULL, 0x0001020488500050ULL, 0x0102040810A000A0ULL, 0x0204081020400040ULL,
+			0x2010080402000204ULL, 0x4020100805000508ULL, 0x804020110A000A11ULL, 0x0080412214001422ULL,
+			0x0001824428002844ULL, 0x0102048850005088ULL, 0x02040810A000A010ULL, 0x0408102040004020ULL,
+			0x1008040200020408ULL, 0x2010080500050810ULL, 0x4020110A000A1120ULL, 0x8041221400142241ULL,
+			0x0182442800284482ULL, 0x0204885000508804ULL, 0x040810A000A01008ULL, 0x0810204000402010ULL,
+			0x0804020002040810ULL, 0x1008050005081020ULL, 0x20110A000A112040ULL, 0x4122140014224180ULL,
+			0x8244280028448201ULL, 0x0488500050880402ULL, 0x0810A000A0100804ULL, 0x1020400040201008ULL,
+			0x0402000204081020ULL, 0x0805000508102040ULL, 0x110A000A11204080ULL, 0x2214001422418000ULL,
+			0x4428002844820100ULL, 0x8850005088040201ULL, 0x10A000A010080402ULL, 0x2040004020100804ULL,
+			0x0200020408102040ULL, 0x0500050810204080ULL, 0x0A000A1120408000ULL, 0x1400142241800000ULL,
+			0x2800284482010000ULL, 0x5000508804020100ULL, 0xA000A01008040201ULL, 0x4000402010080402ULL,
+			0x0002040810204080ULL, 0x0005081020408000ULL, 0x000A112040800000ULL, 0x0014224180000000ULL,
+			0x0028448201000000ULL, 0x0050880402010000ULL, 0x00A0100804020100ULL, 0x0040201008040201ULL,
+		},
+		{
+			0x01010101010101FEULL, 0x02020202020202FDULL, 0x04040404040404FBULL, 0x08080808080808F7ULL,
+			0x10101010101010EFULL, 0x20202020202020DFULL, 0x40404040404040BFULL, 0x808080808080807FULL,
+			0x010101010101FE01ULL, 0x020202020202FD02ULL, 0x040404040404FB04ULL, 0x080808080808F708ULL,
+			0x101010101010EF10ULL, 0x202020202020DF20ULL, 0x404040404040BF40ULL, 0x8080808080807F80ULL,
+			0x0101010101FE0101ULL, 0x0202020202FD0202ULL, 0x0404040404FB0404ULL, 0x0808080808F70808ULL,
+			0x1010101010EF1010ULL, 0x2020202020DF2020ULL, 0x4040404040BF4040ULL, 0x80808080807F8080ULL,
+			0x01010101FE010101ULL, 0x02020202FD020202ULL, 0x04040404FB040404ULL, 0x08080808F7080808ULL,
+			0x10101010EF101010ULL, 0x20202020DF202020ULL, 0x40404040BF404040ULL, 0x808080807F808080ULL,
+			0x010101FE01010101ULL, 0x020202FD02020202ULL, 0x040404FB04040404ULL, 0x080808F708080808ULL,
+			0x101010EF10101010ULL, 0x202020DF20202020ULL, 0x404040BF40404040ULL, 0x8080807F80808080ULL,
+			0x0101FE0101010101ULL, 0x0202FD0202020202ULL, 0x0404FB0404040404ULL, 0x0808F70808080808ULL,
+			0x1010EF1010101010ULL, 0x2020DF2020202020ULL, 0x4040BF4040404040ULL, 0x80807F8080808080ULL,
+			0x01FE010101010101ULL, 0x02FD020202020202ULL, 0x04FB040404040404ULL, 0x08F7080808080808ULL,
+			0x10EF101010101010ULL, 0x20DF202020202020ULL, 0x40BF404040404040ULL, 0x807F808080808080ULL,
+			0xFE01010101010101ULL, 0xFD02020202020202ULL, 0xFB04040404040404ULL, 0xF708080808080808ULL,
+			0xEF10101010101010ULL, 0xDF20202020202020ULL, 0xBF40404040404040ULL, 0x7F80808080808080ULL,
+		},
+		{
+			0x81412111090503FEULL, 0x02824222120A07FDULL, 0x0404844424150EFBULL, 0x08080888492A1CF7ULL,
+			0x10101011925438EFULL, 0x2020212224A870DFULL, 0x404142444850E0BFULL, 0x8182848890A0C07FULL,
+			0x412111090503FE03ULL, 0x824222120A07FD07ULL, 0x04844424150EFB0EULL, 0x080888492A1CF71CULL,
+			0x101011925438EF38ULL, 0x20212224A870DF70ULL, 0x4142444850E0BFE0ULL, 0x82848890A0C07FC0ULL,
+			0x2111090503FE0305ULL, 0x4222120A07FD070AULL, 0x844424150EFB0E15ULL, 0x0888492A1CF71C2AULL,
+			0x1011925438EF3854ULL, 0x212224A870DF70A8ULL, 0x42444850E0BFE050ULL, 0x848890A0C07FC0A0ULL,
+			0x11090503FE030509ULL, 0x22120A07FD070A12ULL, 0x4424150EFB0E1524ULL, 0x88492A1CF71C2A49ULL,
+			0x11925438EF385492ULL, 0x2224A870DF70A824ULL, 0x444850E0BFE05048ULL, 0x8890A0C07FC0A090ULL,
+			0x090503FE03050911ULL, 0x120A07FD070A1222ULL, 0x24150EFB0E152444ULL, 0x492A1CF71C2A4988ULL,
+			0x925438EF38549211ULL, 0x24A870DF70A82422ULL, 0x4850E0BFE0504844ULL, 0x90A0C07FC0A09088ULL,
+			0x0503FE0305091121ULL, 0x0A07FD070A122242ULL, 0x150EFB0E15244484ULL, 0x2A1CF71C2A498808ULL,
+			0x5438EF3854921110ULL, 0xA870DF70A8242221ULL, 0x50E0BFE050484442ULL, 0xA0C07FC0A0908884ULL,
+			0x03FE030509112141ULL, 0x07FD070A12224282ULL, 0x0EFB0E1524448404ULL, 0x1CF71C2A49880808ULL,
+			0x38EF385492111010ULL, 0x70DF70A824222120ULL, 0xE0BFE05048444241ULL, 0xC07FC0A090888482ULL,
+			0xFE03050911214181ULL, 0xFD070A1222428202ULL, 0xFB0E152444840404ULL, 0xF71C2A4988080808ULL,
+			0xEF38549211101010ULL, 0xDF70A82422212020ULL, 0xBFE0504844424140ULL, 0x7FC0A09088848281ULL,
+		},
+		{
+			0x0000000000000302ULL, 0x0000000000000705ULL, 0x0000000000000E0AULL, 0x0000000000001C14ULL,
+			0x0000000000003828ULL, 0x0000000000007050ULL, 0x000000000000E0A0ULL, 0x000000000000C040ULL,
+			0x0000000000030203ULL, 0x0000000000070507ULL, 0x00000000000E0A0EULL, 0x00000000001C141CULL,
+			0x0000000000382838ULL, 0x0000000000705070ULL, 0x0000000000E0A0E0ULL, 0x0000000000C040C0ULL,
+			0x0000000003020300ULL, 0x0000000007050700ULL, 0x000000000E0A0E00ULL, 0x000000001C141C00ULL,
+			0x0000000038283800ULL, 0x0000000070507000ULL, 0x00000000E0A0E000ULL, 0x00000000C040C000ULL,
+			0x0000000302030000ULL, 0x0000000705070000ULL, 0x0000000E0A0E0000ULL, 0x0000001C141C0000ULL,
+			0x0000003828380000ULL, 0x0000007050700000ULL, 0x000000E0A0E00000ULL, 0x000000C040C00000ULL,
+			0x0000030203000000ULL, 0x0000070507000000ULL, 0x00000E0A0E000000ULL, 0x00001C141C000000ULL,
+			0x0000382838000000ULL, 0x0000705070000000ULL, 0x0000E0A0E0000000ULL, 0x0000C040C0000000ULL,
+			0x0003020300000000ULL, 0x0007050700000000ULL, 0x000E0A0E00000000ULL, 0x001C141C00000000ULL,
+			0x0038283800000000ULL, 0x0070507000000000ULL, 0x00E0A0E000000000ULL, 0x00C040C000000000ULL,
+			0x0302030000000000ULL, 0x0705070000000000ULL, 0x0E0A0E0000000000ULL, 0x1C141C0000000000ULL,
+			0x3828380000000000ULL, 0x7050700000000000ULL, 0xE0A0E00000000000ULL, 0xC040C00000000000ULL,
+			0x0203000000000000ULL, 0x0507000000000000ULL, 0x0A0E000000000000ULL, 0x141C000000000000ULL,
+			0x2838000000000000ULL, 0x5070000000000000ULL, 0xA0E0000000000000ULL, 0x40C0000000000000ULL,
+		}
+		#pragma endregion
+	};
+
+	const position::ray position::rays[max_indices + 1] =
+	{
+		#pragma region rays data
+		ray(0x0101010101010100ULL, 0x8040201008040200ULL, 0x00000000000000FEULL, 0x0000000000000000ULL,
+		    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0202020202020200ULL, 0x0080402010080400ULL, 0x00000000000000FCULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000001ULL, 0x0000000000000100ULL),
+		ray(0x0404040404040400ULL, 0x0000804020100800ULL, 0x00000000000000F8ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000003ULL, 0x0000000000010200ULL),
+		ray(0x0808080808080800ULL, 0x0000008040201000ULL, 0x00000000000000F0ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000007ULL, 0x0000000001020400ULL),
+		ray(0x1010101010101000ULL, 0x0000000080402000ULL, 0x00000000000000E0ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x000000000000000FULL, 0x0000000102040800ULL),
+		ray(0x2020202020202000ULL, 0x0000000000804000ULL, 0x00000000000000C0ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x000000000000001FULL, 0x0000010204081000ULL),
+		ray(0x4040404040404000ULL, 0x0000000000008000ULL, 0x0000000000000080ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x000000000000003FULL, 0x0001020408102000ULL),
+		ray(0x8080808080808000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x000000000000007FULL, 0x0102040810204000ULL),
+		ray(0x0101010101010000ULL, 0x4020100804020000ULL, 0x000000000000FE00ULL, 0x0000000000000002ULL,
+			0x0000000000000001ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0202020202020000ULL, 0x8040201008040000ULL, 0x000000000000FC00ULL, 0x0000000000000004ULL,
+			0x0000000000000002ULL, 0x0000000000000001ULL, 0x0000000000000100ULL, 0x0000000000010000ULL),
+		ray(0x0404040404040000ULL, 0x0080402010080000ULL, 0x000000000000F800ULL, 0x0000000000000008ULL,
+			0x0000000000000004ULL, 0x0000000000000002ULL, 0x0000000000000300ULL, 0x0000000001020000ULL),
+		ray(0x0808080808080000ULL, 0x0000804020100000ULL, 0x000000000000F000ULL, 0x0000000000000010ULL,
+			0x0000000000000008ULL, 0x0000000000000004ULL, 0x0000000000000700ULL, 0x0000000102040000ULL),
+		ray(0x1010101010100000ULL, 0x0000008040200000ULL, 0x000000000000E000ULL, 0x0000000000000020ULL,
+			0x0000000000000010ULL, 0x0000000000000008ULL, 0x0000000000000F00ULL, 0x0000010204080000ULL),
+		ray(0x2020202020200000ULL, 0x0000000080400000ULL, 0x000000000000C000ULL, 0x0000000000000040ULL,
+			0x0000000000000020ULL, 0x0000000000000010ULL, 0x0000000000001F00ULL, 0x0001020408100000ULL),
+		ray(0x4040404040400000ULL, 0x0000000000800000ULL, 0x0000000000008000ULL, 0x0000000000000080ULL,
+			0x0000000000000040ULL, 0x0000000000000020ULL, 0x0000000000003F00ULL, 0x0102040810200000ULL),
+		ray(0x8080808080800000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000080ULL, 0x0000000000000040ULL, 0x0000000000007F00ULL, 0x0204081020400000ULL),
+		ray(0x0101010101000000ULL, 0x2010080402000000ULL, 0x0000000000FE0000ULL, 0x0000000000000204ULL,
+			0x0000000000000101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0202020202000000ULL, 0x4020100804000000ULL, 0x0000000000FC0000ULL, 0x0000000000000408ULL,
+			0x0000000000000202ULL, 0x0000000000000100ULL, 0x0000000000010000ULL, 0x0000000001000000ULL),
+		ray(0x0404040404000000ULL, 0x8040201008000000ULL, 0x0000000000F80000ULL, 0x0000000000000810ULL,
+			0x0000000000000404ULL, 0x0000000000000201ULL, 0x0000000000030000ULL, 0x0000000102000000ULL),
+		ray(0x0808080808000000ULL, 0x0080402010000000ULL, 0x0000000000F00000ULL, 0x0000000000001020ULL,
+			0x0000000000000808ULL, 0x0000000000000402ULL, 0x0000000000070000ULL, 0x0000010204000000ULL),
+		ray(0x1010101010000000ULL, 0x0000804020000000ULL, 0x0000000000E00000ULL, 0x0000000000002040ULL,
+			0x0000000000001010ULL, 0x0000000000000804ULL, 0x00000000000F0000ULL, 0x0001020408000000ULL),
+		ray(0x2020202020000000ULL, 0x0000008040000000ULL, 0x0000000000C00000ULL, 0x0000000000004080ULL,
+			0x0000000000002020ULL, 0x0000000000001008ULL, 0x00000000001F0000ULL, 0x0102040810000000ULL),
+		ray(0x4040404040000000ULL, 0x0000000080000000ULL, 0x0000000000800000ULL, 0x0000000000008000ULL,
+			0x0000000000004040ULL, 0x0000000000002010ULL, 0x00000000003F0000ULL, 0x0204081020000000ULL),
+		ray(0x8080808080000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000008080ULL, 0x0000000000004020ULL, 0x00000000007F0000ULL, 0x0408102040000000ULL),
+		ray(0x0101010100000000ULL, 0x1008040200000000ULL, 0x00000000FE000000ULL, 0x0000000000020408ULL,
+			0x0000000000010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0202020200000000ULL, 0x2010080400000000ULL, 0x00000000FC000000ULL, 0x0000000000040810ULL,
+			0x0000000000020202ULL, 0x0000000000010000ULL, 0x0000000001000000ULL, 0x0000000100000000ULL),
+		ray(0x0404040400000000ULL, 0x4020100800000000ULL, 0x00000000F8000000ULL, 0x0000000000081020ULL,
+			0x0000000000040404ULL, 0x0000000000020100ULL, 0x0000000003000000ULL, 0x0000010200000000ULL),
+		ray(0x0808080800000000ULL, 0x8040201000000000ULL, 0x00000000F0000000ULL, 0x0000000000102040ULL,
+			0x0000000000080808ULL, 0x0000000000040201ULL, 0x0000000007000000ULL, 0x0001020400000000ULL),
+		ray(0x1010101000000000ULL, 0x0080402000000000ULL, 0x00000000E0000000ULL, 0x0000000000204080ULL,
+			0x0000000000101010ULL, 0x0000000000080402ULL, 0x000000000F000000ULL, 0x0102040800000000ULL),
+		ray(0x2020202000000000ULL, 0x0000804000000000ULL, 0x00000000C0000000ULL, 0x0000000000408000ULL,
+			0x0000000000202020ULL, 0x0000000000100804ULL, 0x000000001F000000ULL, 0x0204081000000000ULL),
+		ray(0x4040404000000000ULL, 0x0000008000000000ULL, 0x0000000080000000ULL, 0x0000000000800000ULL,
+			0x0000000000404040ULL, 0x0000000000201008ULL, 0x000000003F000000ULL, 0x0408102000000000ULL),
+		ray(0x8080808000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000808080ULL, 0x0000000000402010ULL, 0x000000007F000000ULL, 0x0810204000000000ULL),
+		ray(0x0101010000000000ULL, 0x0804020000000000ULL, 0x000000FE00000000ULL, 0x0000000002040810ULL,
+			0x0000000001010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0202020000000000ULL, 0x1008040000000000ULL, 0x000000FC00000000ULL, 0x0000000004081020ULL,
+			0x0000000002020202ULL, 0x0000000001000000ULL, 0x0000000100000000ULL, 0x0000010000000000ULL),
+		ray(0x0404040000000000ULL, 0x2010080000000000ULL, 0x000000F800000000ULL, 0x0000000008102040ULL,
+			0x0000000004040404ULL, 0x0000000002010000ULL, 0x0000000300000000ULL, 0x0001020000000000ULL),
+		ray(0x0808080000000000ULL, 0x4020100000000000ULL, 0x000000F000000000ULL, 0x0000000010204080ULL,
+			0x0000000008080808ULL, 0x0000000004020100ULL, 0x0000000700000000ULL, 0x0102040000000000ULL),
+		ray(0x1010100000000000ULL, 0x8040200000000000ULL, 0x000000E000000000ULL, 0x0000000020408000ULL,
+			0x0000000010101010ULL, 0x0000000008040201ULL, 0x0000000F00000000ULL, 0x0204080000000000ULL),
+		ray(0x2020200000000000ULL, 0x0080400000000000ULL, 0x000000C000000000ULL, 0x0000000040800000ULL,
+			0x0000000020202020ULL, 0x0000000010080402ULL, 0x0000001F00000000ULL, 0x0408100000000000ULL),
+		ray(0x4040400000000000ULL, 0x0000800000000000ULL, 0x0000008000000000ULL, 0x0000000080000000ULL,
+			0x0000000040404040ULL, 0x0000000020100804ULL, 0x0000003F00000000ULL, 0x0810200000000000ULL),
+		ray(0x8080800000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000080808080ULL, 0x0000000040201008ULL, 0x0000007F00000000ULL, 0x1020400000000000ULL),
+		ray(0x0101000000000000ULL, 0x0402000000000000ULL, 0x0000FE0000000000ULL, 0x0000000204081020ULL,
+			0x0000000101010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0202000000000000ULL, 0x0804000000000000ULL, 0x0000FC0000000000ULL, 0x0000000408102040ULL,
+			0x0000000202020202ULL, 0x0000000100000000ULL, 0x0000010000000000ULL, 0x0001000000000000ULL),
+		ray(0x0404000000000000ULL, 0x1008000000000000ULL, 0x0000F80000000000ULL, 0x0000000810204080ULL,
+			0x0000000404040404ULL, 0x0000000201000000ULL, 0x0000030000000000ULL, 0x0102000000000000ULL),
+		ray(0x0808000000000000ULL, 0x2010000000000000ULL, 0x0000F00000000000ULL, 0x0000001020408000ULL,
+			0x0000000808080808ULL, 0x0000000402010000ULL, 0x0000070000000000ULL, 0x0204000000000000ULL),
+		ray(0x1010000000000000ULL, 0x4020000000000000ULL, 0x0000E00000000000ULL, 0x0000002040800000ULL,
+			0x0000001010101010ULL, 0x0000000804020100ULL, 0x00000F0000000000ULL, 0x0408000000000000ULL),
+		ray(0x2020000000000000ULL, 0x8040000000000000ULL, 0x0000C00000000000ULL, 0x0000004080000000ULL,
+			0x0000002020202020ULL, 0x0000001008040201ULL, 0x00001F0000000000ULL, 0x0810000000000000ULL),
+		ray(0x4040000000000000ULL, 0x0080000000000000ULL, 0x0000800000000000ULL, 0x0000008000000000ULL,
+			0x0000004040404040ULL, 0x0000002010080402ULL, 0x00003F0000000000ULL, 0x1020000000000000ULL),
+		ray(0x8080000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000008080808080ULL, 0x0000004020100804ULL, 0x00007F0000000000ULL, 0x2040000000000000ULL),
+		ray(0x0100000000000000ULL, 0x0200000000000000ULL, 0x00FE000000000000ULL, 0x0000020408102040ULL,
+			0x0000010101010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0200000000000000ULL, 0x0400000000000000ULL, 0x00FC000000000000ULL, 0x0000040810204080ULL,
+			0x0000020202020202ULL, 0x0000010000000000ULL, 0x0001000000000000ULL, 0x0100000000000000ULL),
+		ray(0x0400000000000000ULL, 0x0800000000000000ULL, 0x00F8000000000000ULL, 0x0000081020408000ULL,
+			0x0000040404040404ULL, 0x0000020100000000ULL, 0x0003000000000000ULL, 0x0200000000000000ULL),
+		ray(0x0800000000000000ULL, 0x1000000000000000ULL, 0x00F0000000000000ULL, 0x0000102040800000ULL,
+			0x0000080808080808ULL, 0x0000040201000000ULL, 0x0007000000000000ULL, 0x0400000000000000ULL),
+		ray(0x1000000000000000ULL, 0x2000000000000000ULL, 0x00E0000000000000ULL, 0x0000204080000000ULL,
+			0x0000101010101010ULL, 0x0000080402010000ULL, 0x000F000000000000ULL, 0x0800000000000000ULL),
+		ray(0x2000000000000000ULL, 0x4000000000000000ULL, 0x00C0000000000000ULL, 0x0000408000000000ULL,
+			0x0000202020202020ULL, 0x0000100804020100ULL, 0x001F000000000000ULL, 0x1000000000000000ULL),
+		ray(0x4000000000000000ULL, 0x8000000000000000ULL, 0x0080000000000000ULL, 0x0000800000000000ULL,
+			0x0000404040404040ULL, 0x0000201008040201ULL, 0x003F000000000000ULL, 0x2000000000000000ULL),
+		ray(0x8000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000808080808080ULL, 0x0000402010080402ULL, 0x007F000000000000ULL, 0x4000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xFE00000000000000ULL, 0x0002040810204080ULL,
+			0x0001010101010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xFC00000000000000ULL, 0x0004081020408000ULL,
+			0x0002020202020202ULL, 0x0001000000000000ULL, 0x0100000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xF800000000000000ULL, 0x0008102040800000ULL,
+			0x0004040404040404ULL, 0x0002010000000000ULL, 0x0300000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xF000000000000000ULL, 0x0010204080000000ULL,
+			0x0008080808080808ULL, 0x0004020100000000ULL, 0x0700000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xE000000000000000ULL, 0x0020408000000000ULL,
+			0x0010101010101010ULL, 0x0008040201000000ULL, 0x0F00000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xC000000000000000ULL, 0x0040800000000000ULL,
+			0x0020202020202020ULL, 0x0010080402010000ULL, 0x1F00000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0x8000000000000000ULL, 0x0080000000000000ULL,
+			0x0040404040404040ULL, 0x0020100804020100ULL, 0x3F00000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0080808080808080ULL, 0x0040201008040201ULL, 0x7F00000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL)
+		#pragma endregion
+	};
+
+	const position::ray position::revs[max_indices + 1] =
+	{
+		#pragma region revs data
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0080808080808080ULL, 0x0040201008040201ULL, 0x7F00000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0x8000000000000000ULL, 0x0080000000000000ULL,
+			0x0040404040404040ULL, 0x0020100804020100ULL, 0x3F00000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xC000000000000000ULL, 0x0040800000000000ULL,
+			0x0020202020202020ULL, 0x0010080402010000ULL, 0x1F00000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xE000000000000000ULL, 0x0020408000000000ULL,
+			0x0010101010101010ULL, 0x0008040201000000ULL, 0x0F00000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xF000000000000000ULL, 0x0010204080000000ULL,
+			0x0008080808080808ULL, 0x0004020100000000ULL, 0x0700000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xF800000000000000ULL, 0x0008102040800000ULL,
+			0x0004040404040404ULL, 0x0002010000000000ULL, 0x0300000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xFC00000000000000ULL, 0x0004081020408000ULL,
+			0x0002020202020202ULL, 0x0001000000000000ULL, 0x0100000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0xFE00000000000000ULL, 0x0002040810204080ULL,
+			0x0001010101010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x8000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000808080808080ULL, 0x0000402010080402ULL, 0x007F000000000000ULL, 0x4000000000000000ULL),
+		ray(0x4000000000000000ULL, 0x8000000000000000ULL, 0x0080000000000000ULL, 0x0000800000000000ULL,
+			0x0000404040404040ULL, 0x0000201008040201ULL, 0x003F000000000000ULL, 0x2000000000000000ULL),
+		ray(0x2000000000000000ULL, 0x4000000000000000ULL, 0x00C0000000000000ULL, 0x0000408000000000ULL,
+			0x0000202020202020ULL, 0x0000100804020100ULL, 0x001F000000000000ULL, 0x1000000000000000ULL),
+		ray(0x1000000000000000ULL, 0x2000000000000000ULL, 0x00E0000000000000ULL, 0x0000204080000000ULL,
+			0x0000101010101010ULL, 0x0000080402010000ULL, 0x000F000000000000ULL, 0x0800000000000000ULL),
+		ray(0x0800000000000000ULL, 0x1000000000000000ULL, 0x00F0000000000000ULL, 0x0000102040800000ULL,
+			0x0000080808080808ULL, 0x0000040201000000ULL, 0x0007000000000000ULL, 0x0400000000000000ULL),
+		ray(0x0400000000000000ULL, 0x0800000000000000ULL, 0x00F8000000000000ULL, 0x0000081020408000ULL,
+			0x0000040404040404ULL, 0x0000020100000000ULL, 0x0003000000000000ULL, 0x0200000000000000ULL),
+		ray(0x0200000000000000ULL, 0x0400000000000000ULL, 0x00FC000000000000ULL, 0x0000040810204080ULL,
+			0x0000020202020202ULL, 0x0000010000000000ULL, 0x0001000000000000ULL, 0x0100000000000000ULL),
+		ray(0x0100000000000000ULL, 0x0200000000000000ULL, 0x00FE000000000000ULL, 0x0000020408102040ULL,
+			0x0000010101010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x8080000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000008080808080ULL, 0x0000004020100804ULL, 0x00007F0000000000ULL, 0x2040000000000000ULL),
+		ray(0x4040000000000000ULL, 0x0080000000000000ULL, 0x0000800000000000ULL, 0x0000008000000000ULL,
+			0x0000004040404040ULL, 0x0000002010080402ULL, 0x00003F0000000000ULL, 0x1020000000000000ULL),
+		ray(0x2020000000000000ULL, 0x8040000000000000ULL, 0x0000C00000000000ULL, 0x0000004080000000ULL,
+			0x0000002020202020ULL, 0x0000001008040201ULL, 0x00001F0000000000ULL, 0x0810000000000000ULL),
+		ray(0x1010000000000000ULL, 0x4020000000000000ULL, 0x0000E00000000000ULL, 0x0000002040800000ULL,
+			0x0000001010101010ULL, 0x0000000804020100ULL, 0x00000F0000000000ULL, 0x0408000000000000ULL),
+		ray(0x0808000000000000ULL, 0x2010000000000000ULL, 0x0000F00000000000ULL, 0x0000001020408000ULL,
+			0x0000000808080808ULL, 0x0000000402010000ULL, 0x0000070000000000ULL, 0x0204000000000000ULL),
+		ray(0x0404000000000000ULL, 0x1008000000000000ULL, 0x0000F80000000000ULL, 0x0000000810204080ULL,
+			0x0000000404040404ULL, 0x0000000201000000ULL, 0x0000030000000000ULL, 0x0102000000000000ULL),
+		ray(0x0202000000000000ULL, 0x0804000000000000ULL, 0x0000FC0000000000ULL, 0x0000000408102040ULL,
+			0x0000000202020202ULL, 0x0000000100000000ULL, 0x0000010000000000ULL, 0x0001000000000000ULL),
+		ray(0x0101000000000000ULL, 0x0402000000000000ULL, 0x0000FE0000000000ULL, 0x0000000204081020ULL,
+			0x0000000101010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x8080800000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000080808080ULL, 0x0000000040201008ULL, 0x0000007F00000000ULL, 0x1020400000000000ULL),
+		ray(0x4040400000000000ULL, 0x0000800000000000ULL, 0x0000008000000000ULL, 0x0000000080000000ULL,
+			0x0000000040404040ULL, 0x0000000020100804ULL, 0x0000003F00000000ULL, 0x0810200000000000ULL),
+		ray(0x2020200000000000ULL, 0x0080400000000000ULL, 0x000000C000000000ULL, 0x0000000040800000ULL,
+			0x0000000020202020ULL, 0x0000000010080402ULL, 0x0000001F00000000ULL, 0x0408100000000000ULL),
+		ray(0x1010100000000000ULL, 0x8040200000000000ULL, 0x000000E000000000ULL, 0x0000000020408000ULL,
+			0x0000000010101010ULL, 0x0000000008040201ULL, 0x0000000F00000000ULL, 0x0204080000000000ULL),
+		ray(0x0808080000000000ULL, 0x4020100000000000ULL, 0x000000F000000000ULL, 0x0000000010204080ULL,
+			0x0000000008080808ULL, 0x0000000004020100ULL, 0x0000000700000000ULL, 0x0102040000000000ULL),
+		ray(0x0404040000000000ULL, 0x2010080000000000ULL, 0x000000F800000000ULL, 0x0000000008102040ULL,
+			0x0000000004040404ULL, 0x0000000002010000ULL, 0x0000000300000000ULL, 0x0001020000000000ULL),
+		ray(0x0202020000000000ULL, 0x1008040000000000ULL, 0x000000FC00000000ULL, 0x0000000004081020ULL,
+			0x0000000002020202ULL, 0x0000000001000000ULL, 0x0000000100000000ULL, 0x0000010000000000ULL),
+		ray(0x0101010000000000ULL, 0x0804020000000000ULL, 0x000000FE00000000ULL, 0x0000000002040810ULL,
+			0x0000000001010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x8080808000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000808080ULL, 0x0000000000402010ULL, 0x000000007F000000ULL, 0x0810204000000000ULL),
+		ray(0x4040404000000000ULL, 0x0000008000000000ULL, 0x0000000080000000ULL, 0x0000000000800000ULL,
+			0x0000000000404040ULL, 0x0000000000201008ULL, 0x000000003F000000ULL, 0x0408102000000000ULL),
+		ray(0x2020202000000000ULL, 0x0000804000000000ULL, 0x00000000C0000000ULL, 0x0000000000408000ULL,
+			0x0000000000202020ULL, 0x0000000000100804ULL, 0x000000001F000000ULL, 0x0204081000000000ULL),
+		ray(0x1010101000000000ULL, 0x0080402000000000ULL, 0x00000000E0000000ULL, 0x0000000000204080ULL,
+			0x0000000000101010ULL, 0x0000000000080402ULL, 0x000000000F000000ULL, 0x0102040800000000ULL),
+		ray(0x0808080800000000ULL, 0x8040201000000000ULL, 0x00000000F0000000ULL, 0x0000000000102040ULL,
+			0x0000000000080808ULL, 0x0000000000040201ULL, 0x0000000007000000ULL, 0x0001020400000000ULL),
+		ray(0x0404040400000000ULL, 0x4020100800000000ULL, 0x00000000F8000000ULL, 0x0000000000081020ULL,
+			0x0000000000040404ULL, 0x0000000000020100ULL, 0x0000000003000000ULL, 0x0000010200000000ULL),
+		ray(0x0202020200000000ULL, 0x2010080400000000ULL, 0x00000000FC000000ULL, 0x0000000000040810ULL,
+			0x0000000000020202ULL, 0x0000000000010000ULL, 0x0000000001000000ULL, 0x0000000100000000ULL),
+		ray(0x0101010100000000ULL, 0x1008040200000000ULL, 0x00000000FE000000ULL, 0x0000000000020408ULL,
+			0x0000000000010101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x8080808080000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000008080ULL, 0x0000000000004020ULL, 0x00000000007F0000ULL, 0x0408102040000000ULL),
+		ray(0x4040404040000000ULL, 0x0000000080000000ULL, 0x0000000000800000ULL, 0x0000000000008000ULL,
+			0x0000000000004040ULL, 0x0000000000002010ULL, 0x00000000003F0000ULL, 0x0204081020000000ULL),
+		ray(0x2020202020000000ULL, 0x0000008040000000ULL, 0x0000000000C00000ULL, 0x0000000000004080ULL,
+			0x0000000000002020ULL, 0x0000000000001008ULL, 0x00000000001F0000ULL, 0x0102040810000000ULL),
+		ray(0x1010101010000000ULL, 0x0000804020000000ULL, 0x0000000000E00000ULL, 0x0000000000002040ULL,
+			0x0000000000001010ULL, 0x0000000000000804ULL, 0x00000000000F0000ULL, 0x0001020408000000ULL),
+		ray(0x0808080808000000ULL, 0x0080402010000000ULL, 0x0000000000F00000ULL, 0x0000000000001020ULL,
+			0x0000000000000808ULL, 0x0000000000000402ULL, 0x0000000000070000ULL, 0x0000010204000000ULL),
+		ray(0x0404040404000000ULL, 0x8040201008000000ULL, 0x0000000000F80000ULL, 0x0000000000000810ULL,
+			0x0000000000000404ULL, 0x0000000000000201ULL, 0x0000000000030000ULL, 0x0000000102000000ULL),
+		ray(0x0202020202000000ULL, 0x4020100804000000ULL, 0x0000000000FC0000ULL, 0x0000000000000408ULL,
+			0x0000000000000202ULL, 0x0000000000000100ULL, 0x0000000000010000ULL, 0x0000000001000000ULL),
+		ray(0x0101010101000000ULL, 0x2010080402000000ULL, 0x0000000000FE0000ULL, 0x0000000000000204ULL,
+			0x0000000000000101ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x8080808080800000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000080ULL, 0x0000000000000040ULL, 0x0000000000007F00ULL, 0x0204081020400000ULL),
+		ray(0x4040404040400000ULL, 0x0000000000800000ULL, 0x0000000000008000ULL, 0x0000000000000080ULL,
+			0x0000000000000040ULL, 0x0000000000000020ULL, 0x0000000000003F00ULL, 0x0102040810200000ULL),
+		ray(0x2020202020200000ULL, 0x0000000080400000ULL, 0x000000000000C000ULL, 0x0000000000000040ULL,
+			0x0000000000000020ULL, 0x0000000000000010ULL, 0x0000000000001F00ULL, 0x0001020408100000ULL),
+		ray(0x1010101010100000ULL, 0x0000008040200000ULL, 0x000000000000E000ULL, 0x0000000000000020ULL,
+			0x0000000000000010ULL, 0x0000000000000008ULL, 0x0000000000000F00ULL, 0x0000010204080000ULL),
+		ray(0x0808080808080000ULL, 0x0000804020100000ULL, 0x000000000000F000ULL, 0x0000000000000010ULL,
+			0x0000000000000008ULL, 0x0000000000000004ULL, 0x0000000000000700ULL, 0x0000000102040000ULL),
+		ray(0x0404040404040000ULL, 0x0080402010080000ULL, 0x000000000000F800ULL, 0x0000000000000008ULL,
+			0x0000000000000004ULL, 0x0000000000000002ULL, 0x0000000000000300ULL, 0x0000000001020000ULL),
+		ray(0x0202020202020000ULL, 0x8040201008040000ULL, 0x000000000000FC00ULL, 0x0000000000000004ULL,
+			0x0000000000000002ULL, 0x0000000000000001ULL, 0x0000000000000100ULL, 0x0000000000010000ULL),
+		ray(0x0101010101010000ULL, 0x4020100804020000ULL, 0x000000000000FE00ULL, 0x0000000000000002ULL,
+			0x0000000000000001ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x8080808080808000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x000000000000007FULL, 0x0102040810204000ULL),
+		ray(0x4040404040404000ULL, 0x0000000000008000ULL, 0x0000000000000080ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x000000000000003FULL, 0x0001020408102000ULL),
+		ray(0x2020202020202000ULL, 0x0000000000804000ULL, 0x00000000000000C0ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x000000000000001FULL, 0x0000010204081000ULL),
+		ray(0x1010101010101000ULL, 0x0000000080402000ULL, 0x00000000000000E0ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x000000000000000FULL, 0x0000000102040800ULL),
+		ray(0x0808080808080800ULL, 0x0000008040201000ULL, 0x00000000000000F0ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000007ULL, 0x0000000001020400ULL),
+		ray(0x0404040404040400ULL, 0x0000804020100800ULL, 0x00000000000000F8ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000003ULL, 0x0000000000010200ULL),
+		ray(0x0202020202020200ULL, 0x0080402010080400ULL, 0x00000000000000FCULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000001ULL, 0x0000000000000100ULL),
+		ray(0x0101010101010100ULL, 0x8040201008040200ULL, 0x00000000000000FEULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL),
+		ray(0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL)
+		#pragma endregion
+	};
+
+	bitboard position::magic_lookup[88507];
+
+	const position::magic_hash position::bishop_magics[max_indices] =
+	{
+		#pragma region bishop_magics data
+		magic_hash(66157, 18428694421974023679ULL, 1187473109101317119ULL),
+		magic_hash(71730, 18446673567257459711ULL, 9223336714375004157ULL),
+		magic_hash(37781, 18446743798293722623ULL, 288441550701068800ULL),
+		magic_hash(21015, 18446744072633576447ULL, 1170795303134035968ULL),
+		magic_hash(47590, 18446744073671530495ULL, 13853037273714524160ULL),
+		magic_hash(835, 18446744065051963391ULL, 2648129775020802048ULL),
+		magic_hash(23592, 18446741857371152383ULL, 578730278520913668ULL),
+		magic_hash(30599, 18446176691079331839ULL, 1155182238468407424ULL),
+		magic_hash(68776, 18437719247841787903ULL, 18420565800289023999ULL),
+		magic_hash(19959, 18428694421974024191ULL, 593981333727348737ULL),
+		magic_hash(21783, 18446673567257329663ULL, 288653413114708096ULL),
+		magic_hash(64836, 18446743798259908607ULL, 306245323880337408ULL),
+		magic_hash(23417, 18446744063976144895ULL, 2310347158529769472ULL),
+		magic_hash(66724, 18446741857366966271ULL, 1187261314343337984ULL),
+		magic_hash(74542, 18446176691079348223ULL, 9188469001234153344ULL),
+		magic_hash(67266, 18445609308449144831ULL, 578171627018125376ULL),
+		magic_hash(26575, 18442231660775734783ULL, 9222949822267379705ULL),
+		magic_hash(67543, 18437719247841917951ULL, 9223020191524333565ULL),
+		magic_hash(24409, 18428694421940729343ULL, 2306265224900983809ULL),
+		magic_hash(30779, 18446673558600936447ULL, 4647151869788945290ULL),
+		magic_hash(17384, 18446741581957421055ULL, 2314815028390789136ULL),
+		magic_hash(18778, 18446176690007683071ULL, 18437719281702141935ULL),
+		magic_hash(65109, 18445609308453330943ULL, 9223363241302802431ULL),
+		magic_hash(20184, 18444474543197110271ULL, 9221115838862475263ULL),
+		magic_hash(38240, 18444487867259288575ULL, 1090988818544ULL),
+		magic_hash(16459, 18442231660809025535ULL, 9223230887045427193ULL),
+		magic_hash(17432, 18437719239318433791ULL, 9223090009958119421ULL),
+		magic_hash(81040, 18428692205904059903ULL, 4570867472252272639ULL),
+		magic_hash(84946, 18446106185164110847ULL, 292734589976199165ULL),
+		magic_hash(18276, 18445609034107058175ULL, 2305878434105819152ULL),
+		magic_hash(8512, 18444474544268767231ULL, 612472197655543809ULL),
+		magic_hash(78544, 18442205014827982847ULL, 2265045493362695ULL),
+		magic_hash(19974, 18445615974745634815ULL, 553992241216ULL),
+		magic_hash(23850, 18444487875781718015ULL, 276996120608ULL),
+		magic_hash(11056, 18442229478797074431ULL, 27023813833162784ULL),
+		magic_hash(68019, 18437151933931044863ULL, 14989104351765610624ULL),
+		magic_hash(85965, 18427559794152570367ULL, 1152957239137415242ULL),
+		magic_hash(80524, 18444404311622941695ULL, 9205355920559695872ULL),
+		magic_hash(38221, 18442205289172170751ULL, 1188932777689485200ULL),
+		magic_hash(64647, 18437666504634789887ULL, 9191846633066727416ULL),
+		magic_hash(61320, 18446181115098558463ULL, 279189160064ULL),
+		magic_hash(67281, 18445618156487565311ULL, 139594580032ULL),
+		magic_hash(79076, 18443929280722223103ULL, 279198499008ULL),
+		magic_hash(17115, 18441114487701372927ULL, 4503601791385728ULL),
+		magic_hash(50718, 18435484901701451775ULL, 1152921764453941296ULL),
+		magic_hash(24659, 18424225731840835071ULL, 2307531983360360472ULL),
+		magic_hash(38291, 18437736736746896383ULL, 18446743798562688988ULL),
+		magic_hash(30605, 18428729399784241151ULL, 68988172306ULL),
+		magic_hash(37759, 18446741857371152383ULL, 576460886529573376ULL),
+		magic_hash(4639, 18446739641032753151ULL, 594475220056658440ULL),
+		magic_hash(21759, 18446733009332731903ULL, 576460752563503233ULL),
+		magic_hash(67799, 18446721936374366207ULL, 1125900041076608ULL),
+		magic_hash(22841, 18446699801153110015ULL, 576460756600479808ULL),
+		magic_hash(66689, 18446656078352351231ULL, 603338863802321408ULL),
+		magic_hash(62548, 18446708820483505663ULL, 18446742973123131421ULL),
+		magic_hash(66597, 18446673567257459711ULL, 18428729606210057999ULL),
+		magic_hash(86749, 18446176691079331839ULL, 1152921573842288770ULL),
+		magic_hash(69558, 18445609308449144831ULL, 9203950263191257135ULL),
+		magic_hash(61589, 18443911593243705343ULL, 9188469139741638527ULL),
+		magic_hash(62533, 18441076915902087167ULL, 18442803424035078081ULL),
+		magic_hash(64387, 18435410299260502015ULL, 610242147571982367ULL),
+		magic_hash(26581, 18424217262266253311ULL, 26177172852973578ULL),
+		magic_hash(76355, 18437719247841787903ULL, 594615890450845658ULL),
+		magic_hash(11140, 18428694421974023679ULL, 1152922330840178696ULL)
+		#pragma endregion
+	};
+
+	const position::magic_hash position::rook_magics[max_indices] =
+	{
+		#pragma region rook_magics data
+		magic_hash(10890, 18446461494909402753ULL, 9234631121814487039ULL),
+		magic_hash(56054, 18446178916109254019ULL, 6916402019615277055ULL),
+		magic_hash(67495, 18445613758508956549ULL, 18442234976255475711ULL),
+		magic_hash(72797, 18444483443308361609ULL, 13511417407733898ULL),
+		magic_hash(17179, 18442222812907171729ULL, 13512448205127728ULL),
+		magic_hash(63978, 18437701552104791969ULL, 9008441047646240ULL),
+		magic_hash(56650, 18428659030500032449ULL, 13511211211554864ULL),
+		magic_hash(15929, 18410573987290513281ULL, 18421974885628248056ULL),
+		magic_hash(55905, 18446461494909370879ULL, 9205348825003917308ULL),
+		magic_hash(26301, 18446178916109222911ULL, 21992397144066ULL),
+		magic_hash(78100, 18445613758508926463ULL, 26389411528776ULL),
+		magic_hash(86245, 18444483443308333567ULL, 9223345648611360696ULL),
+		magic_hash(75228, 18442222812907147775ULL, 18446691290705821615ULL),
+		magic_hash(31661, 18437701552104776191ULL, 26391501865056ULL),
+		magic_hash(38053, 18428659030500033023ULL, 18446717683547242472ULL),
+		magic_hash(37433, 18410573987290513919ULL, 26389090795544ULL),
+		magic_hash(74747, 18446461494901210879ULL, 13510901978890243ULL),
+		magic_hash(53847, 18446178916101258751ULL, 844476478521343ULL),
+		magic_hash(70952, 18445613758501223423ULL, 18446181089329217527ULL),
+		magic_hash(49447, 18444483443301152767ULL, 9205920450792660991ULL),
+		magic_hash(62629, 18442222812901011455ULL, 18446462461260324863ULL),
+		magic_hash(58996, 18437701552100728831ULL, 8939786031088007199ULL),
+		magic_hash(36009, 18428659030500163583ULL, 2323998178495432720ULL),
+		magic_hash(21230, 18410573987290644479ULL, 288371136597606656ULL),
+		magic_hash(51882, 18446461492812250879ULL, 18049583150530568ULL),
+		magic_hash(11841, 18446178914062433791ULL, 4505798785105924ULL),
+		magic_hash(25794, 18445613756529245183ULL, 18446180024110022647ULL),
+		magic_hash(49689, 18444483441462867967ULL, 18356529144533024761ULL),
+		magic_hash(63400, 18442222811330113535ULL, 13835059154257051616ULL),
+		magic_hash(33958, 18437701551064604671ULL, 2308130543272738823ULL),
+		magic_hash(21991, 18428659030533586943ULL, 13833926657740128127ULL),
+		magic_hash(45618, 18410573987324067839ULL, 578702106657038400ULL),
+		magic_hash(70134, 18446460958038490879ULL, 2305852801742274608ULL),
+		magic_hash(75944, 18446178392123244031ULL, 581969641496ULL),
+		magic_hash(68392, 18445613251702815743ULL, 1112398102552ULL),
+		magic_hash(66472, 18444482970861959167ULL, 4611686574627225624ULL),
+		magic_hash(23236, 18442222409180246015ULL, 36169744961110010ULL),
+		magic_hash(19067, 18437701285816819711ULL, 4611712960757628934ULL),
+		magic_hash(0, 18428659039089967103ULL, 18446743523949527039ULL),
+		magic_hash(43566, 18410573995880447999ULL, 140874929406016ULL),
+		magic_hash(29810, 18446324055955930879ULL, 2305845220786317312ULL),
+		magic_hash(65558, 18446044775690665471ULL, 18446737474441966591ULL),
+		magic_hash(77684, 18445484016136879103ULL, 276144592896ULL),
+		magic_hash(73350, 18444362497029306367ULL, 2305843214839435264ULL),
+		magic_hash(61765, 18442119458814160895ULL, 18446743455209082877ULL),
+		magic_hash(49282, 18437633382383869951ULL, 13832788662204502015ULL),
+		magic_hash(78840, 18428661229523288063ULL, 68853737476ULL),
+		magic_hash(82904, 18410576186313768959ULL, 18445618103606814718ULL),
+		magic_hash(24594, 18411277122820570879ULL, 5669358141480ULL),
+		magic_hash(9513, 18411838968950554111ULL, 571239694356ULL),
+		magic_hash(29012, 18412399711257099263ULL, 9223372221542596648ULL),
+		magic_hash(27684, 18413521195870189567ULL, 4611686156948013096ULL),
+		magic_hash(27901, 18415764165096370175ULL, 8646911422261395496ULL),
+		magic_hash(61477, 18420250103548731391ULL, 103093927960ULL),
+		magic_hash(25719, 18429221980453453823ULL, 1769914688190546000ULL),
+		magic_hash(50020, 18411136937243934719ULL, 2306924928660668456ULL),
+		magic_hash(41547, 9367204646130482943ULL, 18446730325249744830ULL),
+		magic_hash(4750, 9511037255406190079ULL, 4611688767357457345ULL),
+		magic_hash(6014, 9654587285881748479ULL, 13799028157677500191ULL),
+		magic_hash(41529, 9941687346832865279ULL, 18446181121465744750ULL),
+		magic_hash(84192, 10515887468735098879ULL, 17221764906077391870ULL),
+		magic_hash(33433, 11664287712539566079ULL, 12673129420131140610ULL),
+		magic_hash(8555, 13961088200148500479ULL, 17182358461140924414ULL),
+		magic_hash(1009, 9331317138511593471ULL, 562962977269890ULL)
+		#pragma endregion
+	};
+
+	const bitboard position::mask_files[max_indices] =
+	{
+		#pragma region mask_files data
+		0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+		0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL,
+		0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+		0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL,
+		0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+		0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL,
+		0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+		0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL,
+		0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+		0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL,
+		0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+		0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL,
+		0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+		0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL,
+		0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+		0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL
+		#pragma endregion
+	};
+
+	const bitboard position::mask_ranks[max_indices] =
+	{
+		#pragma region mask_ranks data
+		0x00000000000000FFULL, 0x00000000000000FFULL, 0x00000000000000FFULL, 0x00000000000000FFULL,
+		0x00000000000000FFULL, 0x00000000000000FFULL, 0x00000000000000FFULL, 0x00000000000000FFULL,
+		0x000000000000FF00ULL, 0x000000000000FF00ULL, 0x000000000000FF00ULL, 0x000000000000FF00ULL,
+		0x000000000000FF00ULL, 0x000000000000FF00ULL, 0x000000000000FF00ULL, 0x000000000000FF00ULL,
+		0x0000000000FF0000ULL, 0x0000000000FF0000ULL, 0x0000000000FF0000ULL, 0x0000000000FF0000ULL,
+		0x0000000000FF0000ULL, 0x0000000000FF0000ULL, 0x0000000000FF0000ULL, 0x0000000000FF0000ULL,
+		0x00000000FF000000ULL, 0x00000000FF000000ULL, 0x00000000FF000000ULL, 0x00000000FF000000ULL,
+		0x00000000FF000000ULL, 0x00000000FF000000ULL, 0x00000000FF000000ULL, 0x00000000FF000000ULL,
+		0x000000FF00000000ULL, 0x000000FF00000000ULL, 0x000000FF00000000ULL, 0x000000FF00000000ULL,
+		0x000000FF00000000ULL, 0x000000FF00000000ULL, 0x000000FF00000000ULL, 0x000000FF00000000ULL,
+		0x0000FF0000000000ULL, 0x0000FF0000000000ULL, 0x0000FF0000000000ULL, 0x0000FF0000000000ULL,
+		0x0000FF0000000000ULL, 0x0000FF0000000000ULL, 0x0000FF0000000000ULL, 0x0000FF0000000000ULL,
+		0x00FF000000000000ULL, 0x00FF000000000000ULL, 0x00FF000000000000ULL, 0x00FF000000000000ULL,
+		0x00FF000000000000ULL, 0x00FF000000000000ULL, 0x00FF000000000000ULL, 0x00FF000000000000ULL,
+		0xFF00000000000000ULL, 0xFF00000000000000ULL, 0xFF00000000000000ULL, 0xFF00000000000000ULL,
+		0xFF00000000000000ULL, 0xFF00000000000000ULL, 0xFF00000000000000ULL, 0xFF00000000000000ULL
+		#pragma endregion
+	};
+
+	const index position::pawn_left[max_colors][max_indices] =
+	{
+		#pragma region pawn_left data
+		{
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, a3, b3, c3, d3, e3, f3, g3,
+			index_none, a4, b4, c4, d4, e4, f4, g4,
+			index_none, a5, b5, c5, d5, e5, f5, g5,
+			index_none, a6, b6, c6, d6, e6, f6, g6,
+			index_none, a7, b7, c7, d7, e7, f7, g7,
+			index_none, a8, b8, c8, d8, e8, f8, g8,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none
+		},
+		{
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, a1, b1, c1, d1, e1, f1, g1,
+			index_none, a2, b2, c2, d2, e2, f2, g2,
+			index_none, a3, b3, c3, d3, e3, f3, g3,
+			index_none, a4, b4, c4, d4, e4, f4, g4,
+			index_none, a5, b5, c5, d5, e5, f5, g5,
+			index_none, a6, b6, c6, d6, e6, f6, g6,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none
+		}
+		#pragma endregion
+	};
+
+	const index position::pawn_right[max_colors][max_indices] =
+	{
+		#pragma region pawn_right data
+		{
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			b3, c3, d3, e3, f3, g3, h3, index_none,
+			b4, c4, d4, e4, f4, g4, h4, index_none,
+			b5, c5, d5, e5, f5, g5, h5, index_none,
+			b6, c6, d6, e6, f6, g6, h6, index_none,
+			b7, c7, d7, e7, f7, g7, h7, index_none,
+			b8, c8, d8, e8, f8, g8, h8, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none
+		},
+		{
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			b1, c1, d1, e1, f1, g1, h1, index_none,
+			b2, c2, d2, e2, f2, g2, h2, index_none,
+			b3, c3, d3, e3, f3, g3, h3, index_none,
+			b4, c4, d4, e4, f4, g4, h4, index_none,
+			b5, c5, d5, e5, f5, g5, h5, index_none,
+			b6, c6, d6, e6, f6, g6, h6, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none
+		}
+		#pragma endregion
+	};
+
+	const index position::pawn_plus[max_colors][max_indices] =
+	{
+		#pragma region pawn_plus data
+		{
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			a3, b3, c3, d3, e3, f3, g3, h3,
+			a4, b4, c4, d4, e4, f4, g4, h4,
+			a5, b5, c5, d5, e5, f5, g5, h5,
+			a6, b6, c6, d6, e6, f6, g6, h6,
+			a7, b7, c7, d7, e7, f7, g7, h7,
+			a8, b8, c8, d8, e8, f8, g8, h8,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none
+		},
+		{
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			a1, b1, c1, d1, e1, f1, g1, h1,
+			a2, b2, c2, d2, e2, f2, g2, h2,
+			a3, b3, c3, d3, e3, f3, g3, h3,
+			a4, b4, c4, d4, e4, f4, g4, h4,
+			a5, b5, c5, d5, e5, f5, g5, h5,
+			a6, b6, c6, d6, e6, f6, g6, h6,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none
+		}
+		#pragma endregion
+	};
+
+	const index position::pawn_double[max_colors][max_indices] =
+	{
+		#pragma region pawn_double data
+		{
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			a4, b4, c4, d4, e4, f4, g4, h4,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none
+		},
+		{
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none,
+			a5, b5, c5, d5, e5, f5, g5, h5,
+			index_none, index_none, index_none, index_none, index_none, index_none, index_none, index_none
+		}
+		#pragma endregion
+	};
+
+	const bitboard position::between[max_indices][max_indices] =
+	{
+		#pragma region between data
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000002ULL, 0x0000000000000006ULL,
+			0x000000000000000EULL, 0x000000000000001EULL, 0x000000000000003EULL, 0x000000000000007EULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000100ULL, 0x0000000000000000ULL, 0x0000000000000200ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000040200ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000001010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000008040200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000101010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000001008040200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000010101010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000201008040200ULL, 0x0000000000000000ULL,
+			0x0001010101010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040201008040200ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000004ULL,
+			0x000000000000000CULL, 0x000000000000001CULL, 0x000000000000003CULL, 0x000000000000007CULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000200ULL, 0x0000000000000000ULL, 0x0000000000000400ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000080400ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000002020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000010080400ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000202020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000002010080400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020202020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000402010080400ULL,
+			0x0000000000000000ULL, 0x0002020202020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000002ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000008ULL, 0x0000000000000018ULL, 0x0000000000000038ULL, 0x0000000000000078ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000200ULL, 0x0000000000000000ULL, 0x0000000000000400ULL, 0x0000000000000000ULL,
+			0x0000000000000800ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000100800ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000004040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000020100800ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000404040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004020100800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040404040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040404040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000006ULL, 0x0000000000000004ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000010ULL, 0x0000000000000030ULL, 0x0000000000000070ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000400ULL, 0x0000000000000000ULL, 0x0000000000000800ULL,
+			0x0000000000000000ULL, 0x0000000000001000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000020400ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000201000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000040201000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000808080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080808080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080808080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x000000000000000EULL, 0x000000000000000CULL, 0x0000000000000008ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000020ULL, 0x0000000000000060ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000800ULL, 0x0000000000000000ULL,
+			0x0000000000001000ULL, 0x0000000000000000ULL, 0x0000000000002000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000040800ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000402000ULL,
+			0x0000000002040800ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000010101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000001010101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000101010101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010101010101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x000000000000001EULL, 0x000000000000001CULL, 0x0000000000000018ULL, 0x0000000000000010ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000040ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000001000ULL,
+			0x0000000000000000ULL, 0x0000000000002000ULL, 0x0000000000000000ULL, 0x0000000000004000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000081000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000004081000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000020202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000204081000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000002020202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000202020202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020202020202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x000000000000003EULL, 0x000000000000003CULL, 0x0000000000000038ULL, 0x0000000000000030ULL,
+			0x0000000000000020ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000002000ULL, 0x0000000000000000ULL, 0x0000000000004000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000102000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000404000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008102000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000040404000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000408102000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004040404000ULL, 0x0000000000000000ULL,
+			0x0000020408102000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000404040404000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040404040404000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x000000000000007EULL, 0x000000000000007CULL, 0x0000000000000078ULL, 0x0000000000000070ULL,
+			0x0000000000000060ULL, 0x0000000000000040ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000004000ULL, 0x0000000000000000ULL, 0x0000000000008000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000204000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000808000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000010204000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000080808000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000810204000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000008080808000ULL,
+			0x0000000000000000ULL, 0x0000040810204000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000808080808000ULL,
+			0x0002040810204000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080808080808000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000200ULL, 0x0000000000000600ULL,
+			0x0000000000000E00ULL, 0x0000000000001E00ULL, 0x0000000000003E00ULL, 0x0000000000007E00ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000010000ULL, 0x0000000000000000ULL, 0x0000000000020000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000001010000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000004020000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000101010000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000804020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000010101010000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000100804020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0001010101010000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0020100804020000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000400ULL,
+			0x0000000000000C00ULL, 0x0000000000001C00ULL, 0x0000000000003C00ULL, 0x0000000000007C00ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000020000ULL, 0x0000000000000000ULL, 0x0000000000040000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000002020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000008040000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000202020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000001008040000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020202020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000201008040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002020202020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040201008040000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000800ULL, 0x0000000000001800ULL, 0x0000000000003800ULL, 0x0000000000007800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000020000ULL, 0x0000000000000000ULL, 0x0000000000040000ULL, 0x0000000000000000ULL,
+			0x0000000000080000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000004040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000010080000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000404040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000002010080000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040404040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000402010080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040404040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000600ULL, 0x0000000000000400ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000001000ULL, 0x0000000000003000ULL, 0x0000000000007000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000040000ULL, 0x0000000000000000ULL, 0x0000000000080000ULL,
+			0x0000000000000000ULL, 0x0000000000100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000002040000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000020100000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000808080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004020100000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080808080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080808080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000E00ULL, 0x0000000000000C00ULL, 0x0000000000000800ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000002000ULL, 0x0000000000006000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000080000ULL, 0x0000000000000000ULL,
+			0x0000000000100000ULL, 0x0000000000000000ULL, 0x0000000000200000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000004080000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000010100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000040200000ULL,
+			0x0000000204080000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000001010100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000101010100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010101010100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000001E00ULL, 0x0000000000001C00ULL, 0x0000000000001800ULL, 0x0000000000001000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000004000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000100000ULL,
+			0x0000000000000000ULL, 0x0000000000200000ULL, 0x0000000000000000ULL, 0x0000000000400000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008100000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000020200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000408100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000002020200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000020408100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000202020200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020202020200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000003E00ULL, 0x0000000000003C00ULL, 0x0000000000003800ULL, 0x0000000000003000ULL,
+			0x0000000000002000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000200000ULL, 0x0000000000000000ULL, 0x0000000000400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000010200000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000040400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000810200000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004040400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000040810200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000404040400000ULL, 0x0000000000000000ULL,
+			0x0002040810200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040404040400000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000007E00ULL, 0x0000000000007C00ULL, 0x0000000000007800ULL, 0x0000000000007000ULL,
+			0x0000000000006000ULL, 0x0000000000004000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000400000ULL, 0x0000000000000000ULL, 0x0000000000800000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000020400000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000080800000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000001020400000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000008080800000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000081020400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000808080800000ULL,
+			0x0000000000000000ULL, 0x0004081020400000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080808080800000ULL,
+		},
+		{
+			0x0000000000000100ULL, 0x0000000000000000ULL, 0x0000000000000200ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000020000ULL, 0x0000000000060000ULL,
+			0x00000000000E0000ULL, 0x00000000001E0000ULL, 0x00000000003E0000ULL, 0x00000000007E0000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000001000000ULL, 0x0000000000000000ULL, 0x0000000002000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000101000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000402000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000010101000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000080402000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0001010101000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0010080402000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000200ULL, 0x0000000000000000ULL, 0x0000000000000400ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000040000ULL,
+			0x00000000000C0000ULL, 0x00000000001C0000ULL, 0x00000000003C0000ULL, 0x00000000007C0000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000002000000ULL, 0x0000000000000000ULL, 0x0000000004000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000202000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000804000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020202000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000100804000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002020202000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0020100804000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000200ULL, 0x0000000000000000ULL, 0x0000000000000400ULL, 0x0000000000000000ULL,
+			0x0000000000000800ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000080000ULL, 0x0000000000180000ULL, 0x0000000000380000ULL, 0x0000000000780000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000002000000ULL, 0x0000000000000000ULL, 0x0000000004000000ULL, 0x0000000000000000ULL,
+			0x0000000008000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000404000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000001008000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040404000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000201008000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040404000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040201008000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000400ULL, 0x0000000000000000ULL, 0x0000000000000800ULL,
+			0x0000000000000000ULL, 0x0000000000001000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000060000ULL, 0x0000000000040000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000100000ULL, 0x0000000000300000ULL, 0x0000000000700000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000004000000ULL, 0x0000000000000000ULL, 0x0000000008000000ULL,
+			0x0000000000000000ULL, 0x0000000010000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000204000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000808000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000002010000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080808000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000402010000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080808000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000800ULL, 0x0000000000000000ULL,
+			0x0000000000001000ULL, 0x0000000000000000ULL, 0x0000000000002000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x00000000000E0000ULL, 0x00000000000C0000ULL, 0x0000000000080000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000200000ULL, 0x0000000000600000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008000000ULL, 0x0000000000000000ULL,
+			0x0000000010000000ULL, 0x0000000000000000ULL, 0x0000000020000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000408000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000001010000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004020000000ULL,
+			0x0000020408000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000101010000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010101010000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000001000ULL,
+			0x0000000000000000ULL, 0x0000000000002000ULL, 0x0000000000000000ULL, 0x0000000000004000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x00000000001E0000ULL, 0x00000000001C0000ULL, 0x0000000000180000ULL, 0x0000000000100000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000400000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000010000000ULL,
+			0x0000000000000000ULL, 0x0000000020000000ULL, 0x0000000000000000ULL, 0x0000000040000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000810000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000002020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000040810000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000202020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0002040810000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020202020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000002000ULL, 0x0000000000000000ULL, 0x0000000000004000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x00000000003E0000ULL, 0x00000000003C0000ULL, 0x0000000000380000ULL, 0x0000000000300000ULL,
+			0x0000000000200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000020000000ULL, 0x0000000000000000ULL, 0x0000000040000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000001020000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004040000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000081020000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000404040000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0004081020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040404040000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000004000ULL, 0x0000000000000000ULL, 0x0000000000008000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x00000000007E0000ULL, 0x00000000007C0000ULL, 0x0000000000780000ULL, 0x0000000000700000ULL,
+			0x0000000000600000ULL, 0x0000000000400000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000040000000ULL, 0x0000000000000000ULL, 0x0000000080000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000002040000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000008080000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000102040000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000808080000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008102040000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080808080000000ULL,
+		},
+		{
+			0x0000000000010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000020400ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000010000ULL, 0x0000000000000000ULL, 0x0000000000020000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000002000000ULL, 0x0000000006000000ULL,
+			0x000000000E000000ULL, 0x000000001E000000ULL, 0x000000003E000000ULL, 0x000000007E000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000100000000ULL, 0x0000000000000000ULL, 0x0000000200000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000010100000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040200000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0001010100000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0008040200000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000040800ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000020000ULL, 0x0000000000000000ULL, 0x0000000000040000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000004000000ULL,
+			0x000000000C000000ULL, 0x000000001C000000ULL, 0x000000003C000000ULL, 0x000000007C000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000200000000ULL, 0x0000000000000000ULL, 0x0000000400000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020200000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000080400000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002020200000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0010080400000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000081000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000020000ULL, 0x0000000000000000ULL, 0x0000000000040000ULL, 0x0000000000000000ULL,
+			0x0000000000080000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000002000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000008000000ULL, 0x0000000018000000ULL, 0x0000000038000000ULL, 0x0000000078000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000200000000ULL, 0x0000000000000000ULL, 0x0000000400000000ULL, 0x0000000000000000ULL,
+			0x0000000800000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040400000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000100800000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040400000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0020100800000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000040200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000102000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000040000ULL, 0x0000000000000000ULL, 0x0000000000080000ULL,
+			0x0000000000000000ULL, 0x0000000000100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000006000000ULL, 0x0000000004000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000010000000ULL, 0x0000000030000000ULL, 0x0000000070000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000400000000ULL, 0x0000000000000000ULL, 0x0000000800000000ULL,
+			0x0000000000000000ULL, 0x0000001000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000020400000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080800000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000201000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080800000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040201000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000080400ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000204000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000080000ULL, 0x0000000000000000ULL,
+			0x0000000000100000ULL, 0x0000000000000000ULL, 0x0000000000200000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x000000000E000000ULL, 0x000000000C000000ULL, 0x0000000008000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000020000000ULL, 0x0000000060000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000800000000ULL, 0x0000000000000000ULL,
+			0x0000001000000000ULL, 0x0000000000000000ULL, 0x0000002000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000040800000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000101000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000402000000000ULL,
+			0x0002040800000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010101000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000100800ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000100000ULL,
+			0x0000000000000000ULL, 0x0000000000200000ULL, 0x0000000000000000ULL, 0x0000000000400000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x000000001E000000ULL, 0x000000001C000000ULL, 0x0000000018000000ULL, 0x0000000010000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000040000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000001000000000ULL,
+			0x0000000000000000ULL, 0x0000002000000000ULL, 0x0000000000000000ULL, 0x0000004000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000081000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000202000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0004081000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020202000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000201000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000404000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000200000ULL, 0x0000000000000000ULL, 0x0000000000400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x000000003E000000ULL, 0x000000003C000000ULL, 0x0000000038000000ULL, 0x0000000030000000ULL,
+			0x0000000020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000002000000000ULL, 0x0000000000000000ULL, 0x0000004000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000102000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000404000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008102000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040404000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000402000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000808000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000400000ULL, 0x0000000000000000ULL, 0x0000000000800000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x000000007E000000ULL, 0x000000007C000000ULL, 0x0000000078000000ULL, 0x0000000070000000ULL,
+			0x0000000060000000ULL, 0x0000000040000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000004000000000ULL, 0x0000000000000000ULL, 0x0000008000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000204000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000808000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0010204000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080808000000000ULL,
+		},
+		{
+			0x0000000001010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000002040800ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000001010000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000002040000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000001000000ULL, 0x0000000000000000ULL, 0x0000000002000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000200000000ULL, 0x0000000600000000ULL,
+			0x0000000E00000000ULL, 0x0000001E00000000ULL, 0x0000003E00000000ULL, 0x0000007E00000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000010000000000ULL, 0x0000000000000000ULL, 0x0000020000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0001010000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004020000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000002020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000004081000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000002020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000004080000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000002000000ULL, 0x0000000000000000ULL, 0x0000000004000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000400000000ULL,
+			0x0000000C00000000ULL, 0x0000001C00000000ULL, 0x0000003C00000000ULL, 0x0000007C00000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020000000000ULL, 0x0000000000000000ULL, 0x0000040000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002020000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0008040000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000004040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008102000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000004040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000008100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000002000000ULL, 0x0000000000000000ULL, 0x0000000004000000ULL, 0x0000000000000000ULL,
+			0x0000000008000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000200000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000800000000ULL, 0x0000001800000000ULL, 0x0000003800000000ULL, 0x0000007800000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000020000000000ULL, 0x0000000000000000ULL, 0x0000040000000000ULL, 0x0000000000000000ULL,
+			0x0000080000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0010080000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000010204000ULL,
+			0x0000000004020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000010200000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000004000000ULL, 0x0000000000000000ULL, 0x0000000008000000ULL,
+			0x0000000000000000ULL, 0x0000000010000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000600000000ULL, 0x0000000400000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000001000000000ULL, 0x0000003000000000ULL, 0x0000007000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000040000000000ULL, 0x0000000000000000ULL, 0x0000080000000000ULL,
+			0x0000000000000000ULL, 0x0000100000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0002040000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0020100000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000008040200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000010101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000008040000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000010100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000020400000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000008000000ULL, 0x0000000000000000ULL,
+			0x0000000010000000ULL, 0x0000000000000000ULL, 0x0000000020000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000E00000000ULL, 0x0000000C00000000ULL, 0x0000000800000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000002000000000ULL, 0x0000006000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080000000000ULL, 0x0000000000000000ULL,
+			0x0000100000000000ULL, 0x0000000000000000ULL, 0x0000200000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0004080000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010100000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040200000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000010080400ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000020202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000010080000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000020200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000010000000ULL,
+			0x0000000000000000ULL, 0x0000000020000000ULL, 0x0000000000000000ULL, 0x0000000040000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000001E00000000ULL, 0x0000001C00000000ULL, 0x0000001800000000ULL, 0x0000001000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000100000000000ULL,
+			0x0000000000000000ULL, 0x0000200000000000ULL, 0x0000000000000000ULL, 0x0000400000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008100000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020200000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000020100800ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000040404000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000020100000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000040400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000020000000ULL, 0x0000000000000000ULL, 0x0000000040000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000003E00000000ULL, 0x0000003C00000000ULL, 0x0000003800000000ULL, 0x0000003000000000ULL,
+			0x0000002000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000200000000000ULL, 0x0000000000000000ULL, 0x0000400000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0010200000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040400000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000040201000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000080808000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000040200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000080800000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000040000000ULL, 0x0000000000000000ULL, 0x0000000080000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000007E00000000ULL, 0x0000007C00000000ULL, 0x0000007800000000ULL, 0x0000007000000000ULL,
+			0x0000006000000000ULL, 0x0000004000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000400000000000ULL, 0x0000000000000000ULL, 0x0000800000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0020400000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080800000000000ULL,
+		},
+		{
+			0x0000000101010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000204081000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000101010000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000204080000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000101000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000204000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000100000000ULL, 0x0000000000000000ULL, 0x0000000200000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000020000000000ULL, 0x0000060000000000ULL,
+			0x00000E0000000000ULL, 0x00001E0000000000ULL, 0x00003E0000000000ULL, 0x00007E0000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0001000000000000ULL, 0x0000000000000000ULL, 0x0002000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000202020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000408102000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000202020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000408100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000202000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000408000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000200000000ULL, 0x0000000000000000ULL, 0x0000000400000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040000000000ULL,
+			0x00000C0000000000ULL, 0x00001C0000000000ULL, 0x00003C0000000000ULL, 0x00007C0000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002000000000000ULL, 0x0000000000000000ULL, 0x0004000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000404040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000810204000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000404040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000810200000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000404000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000810000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000200000000ULL, 0x0000000000000000ULL, 0x0000000400000000ULL, 0x0000000000000000ULL,
+			0x0000000800000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000020000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000080000000000ULL, 0x0000180000000000ULL, 0x0000380000000000ULL, 0x0000780000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0002000000000000ULL, 0x0000000000000000ULL, 0x0004000000000000ULL, 0x0000000000000000ULL,
+			0x0008000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000808080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000808080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000001020400000ULL,
+			0x0000000402000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000808000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000001020000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000400000000ULL, 0x0000000000000000ULL, 0x0000000800000000ULL,
+			0x0000000000000000ULL, 0x0000001000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000060000000000ULL, 0x0000040000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000100000000000ULL, 0x0000300000000000ULL, 0x0000700000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0004000000000000ULL, 0x0000000000000000ULL, 0x0008000000000000ULL,
+			0x0000000000000000ULL, 0x0010000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000001010101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000804020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000001010100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000804000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000001010000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000002040000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000800000000ULL, 0x0000000000000000ULL,
+			0x0000001000000000ULL, 0x0000000000000000ULL, 0x0000002000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x00000E0000000000ULL, 0x00000C0000000000ULL, 0x0000080000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000200000000000ULL, 0x0000600000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008000000000000ULL, 0x0000000000000000ULL,
+			0x0010000000000000ULL, 0x0000000000000000ULL, 0x0020000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000001008040200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000002020202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000001008040000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000002020200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000001008000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000002020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000001000000000ULL,
+			0x0000000000000000ULL, 0x0000002000000000ULL, 0x0000000000000000ULL, 0x0000004000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x00001E0000000000ULL, 0x00001C0000000000ULL, 0x0000180000000000ULL, 0x0000100000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000400000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0010000000000000ULL,
+			0x0000000000000000ULL, 0x0020000000000000ULL, 0x0000000000000000ULL, 0x0040000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000002010080400ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004040404000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000002010080000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004040400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000002010000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004040000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000002000000000ULL, 0x0000000000000000ULL, 0x0000004000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x00003E0000000000ULL, 0x00003C0000000000ULL, 0x0000380000000000ULL, 0x0000300000000000ULL,
+			0x0000200000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0020000000000000ULL, 0x0000000000000000ULL, 0x0040000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004020100800ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000008080808000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000004020100000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000008080800000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000004020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000008080000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000004000000000ULL, 0x0000000000000000ULL, 0x0000008000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x00007E0000000000ULL, 0x00007C0000000000ULL, 0x0000780000000000ULL, 0x0000700000000000ULL,
+			0x0000600000000000ULL, 0x0000400000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0040000000000000ULL, 0x0000000000000000ULL, 0x0080000000000000ULL,
+		},
+		{
+			0x0000010101010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000020408102000ULL, 0x0000000000000000ULL,
+			0x0000010101010000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020408100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000010101000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000020408000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000010100000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000020400000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000010000000000ULL, 0x0000000000000000ULL, 0x0000020000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0002000000000000ULL, 0x0006000000000000ULL,
+			0x000E000000000000ULL, 0x001E000000000000ULL, 0x003E000000000000ULL, 0x007E000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000020202020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040810204000ULL,
+			0x0000000000000000ULL, 0x0000020202020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040810200000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020202000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000040810000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020200000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000040800000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000020000000000ULL, 0x0000000000000000ULL, 0x0000040000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004000000000000ULL,
+			0x000C000000000000ULL, 0x001C000000000000ULL, 0x003C000000000000ULL, 0x007C000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040404040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040404040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000081020400000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040404000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000081020000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000040400000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000081000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000020000000000ULL, 0x0000000000000000ULL, 0x0000040000000000ULL, 0x0000000000000000ULL,
+			0x0000080000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0002000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0008000000000000ULL, 0x0018000000000000ULL, 0x0038000000000000ULL, 0x0078000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080808080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080808080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080808000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000102040000000ULL,
+			0x0000040200000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080800000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000102000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000040000000000ULL, 0x0000000000000000ULL, 0x0000080000000000ULL,
+			0x0000000000000000ULL, 0x0000100000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0006000000000000ULL, 0x0004000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0010000000000000ULL, 0x0030000000000000ULL, 0x0070000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000101010101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000101010100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000080402000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000101010000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000080400000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000101000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000204000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000080000000000ULL, 0x0000000000000000ULL,
+			0x0000100000000000ULL, 0x0000000000000000ULL, 0x0000200000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x000E000000000000ULL, 0x000C000000000000ULL, 0x0008000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0020000000000000ULL, 0x0060000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000202020202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000100804020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000202020200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000100804000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000202020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000100800000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000202000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000100000000000ULL,
+			0x0000000000000000ULL, 0x0000200000000000ULL, 0x0000000000000000ULL, 0x0000400000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x001E000000000000ULL, 0x001C000000000000ULL, 0x0018000000000000ULL, 0x0010000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000201008040200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000404040404000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000201008040000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000404040400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000201008000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000404040000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000201000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000404000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000200000000000ULL, 0x0000000000000000ULL, 0x0000400000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x003E000000000000ULL, 0x003C000000000000ULL, 0x0038000000000000ULL, 0x0030000000000000ULL,
+			0x0020000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000402010080400ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000808080808000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000402010080000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000808080800000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000402010000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000808080000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000402000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000808000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000400000000000ULL, 0x0000000000000000ULL, 0x0000800000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x007E000000000000ULL, 0x007C000000000000ULL, 0x0078000000000000ULL, 0x0070000000000000ULL,
+			0x0060000000000000ULL, 0x0040000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0001010101010100ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0002040810204000ULL,
+			0x0001010101010000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0002040810200000ULL, 0x0000000000000000ULL,
+			0x0001010101000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002040810000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0001010100000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0002040800000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0001010000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0002040000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0001000000000000ULL, 0x0000000000000000ULL, 0x0002000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0200000000000000ULL, 0x0600000000000000ULL,
+			0x0E00000000000000ULL, 0x1E00000000000000ULL, 0x3E00000000000000ULL, 0x7E00000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0002020202020200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002020202020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004081020400000ULL,
+			0x0000000000000000ULL, 0x0002020202000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004081020000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002020200000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0004081000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002020000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0004080000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0002000000000000ULL, 0x0000000000000000ULL, 0x0004000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0400000000000000ULL,
+			0x0C00000000000000ULL, 0x1C00000000000000ULL, 0x3C00000000000000ULL, 0x7C00000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040404040400ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040404040000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040404000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008102040000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040400000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008102000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0004040000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0008100000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0002000000000000ULL, 0x0000000000000000ULL, 0x0004000000000000ULL, 0x0000000000000000ULL,
+			0x0008000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0200000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0800000000000000ULL, 0x1800000000000000ULL, 0x3800000000000000ULL, 0x7800000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080808080800ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080808080000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080808000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080800000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0010204000000000ULL,
+			0x0004020000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008080000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0010200000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0004000000000000ULL, 0x0000000000000000ULL, 0x0008000000000000ULL,
+			0x0000000000000000ULL, 0x0010000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0600000000000000ULL, 0x0400000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x1000000000000000ULL, 0x3000000000000000ULL, 0x7000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010101010101000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010101010100000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010101010000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0008040200000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010101000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0008040000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010100000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0020400000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0008000000000000ULL, 0x0000000000000000ULL,
+			0x0010000000000000ULL, 0x0000000000000000ULL, 0x0020000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0E00000000000000ULL, 0x0C00000000000000ULL, 0x0800000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x2000000000000000ULL, 0x6000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020202020202000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020202020200000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0010080402000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020202020000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0010080400000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020202000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0010080000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020200000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0010000000000000ULL,
+			0x0000000000000000ULL, 0x0020000000000000ULL, 0x0000000000000000ULL, 0x0040000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x1E00000000000000ULL, 0x1C00000000000000ULL, 0x1800000000000000ULL, 0x1000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x4000000000000000ULL,
+		},
+		{
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040404040404000ULL, 0x0000000000000000ULL,
+			0x0020100804020000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040404040400000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0020100804000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040404040000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0020100800000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040404000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0020100000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040400000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0020000000000000ULL, 0x0000000000000000ULL, 0x0040000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x3E00000000000000ULL, 0x3C00000000000000ULL, 0x3800000000000000ULL, 0x3000000000000000ULL,
+			0x2000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+		},
+		{
+			0x0040201008040200ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080808080808000ULL,
+			0x0000000000000000ULL, 0x0040201008040000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080808080800000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040201008000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080808080000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0040201000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080808000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0040200000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0080800000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0040000000000000ULL, 0x0000000000000000ULL, 0x0080000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+			0x7E00000000000000ULL, 0x7C00000000000000ULL, 0x7800000000000000ULL, 0x7000000000000000ULL,
+			0x6000000000000000ULL, 0x4000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL
+		}
+		#pragma endregion
+	};
+
+	const int position::ep_offset[max_colors] = { -8, 8 };
+
+	const uint8_t position::castle_mask[max_indices] =
+	{
+		13, 15, 15, 15, 12, 15, 15, 14,
+		15, 15, 15, 15, 15, 15, 15, 15,
+		15, 15, 15, 15, 15, 15, 15, 15,
+		15, 15, 15, 15, 15, 15, 15, 15,
+		15, 15, 15, 15, 15, 15, 15, 15,
+		15, 15, 15, 15, 15, 15, 15, 15,
+		15, 15, 15, 15, 15, 15, 15, 15,
+		 7, 15, 15, 15,  3, 15, 15, 11
+	};
+
+	const position::castling_info position::castling_information[4] =
+	{
+		castling_info{e1, c1, d1, a1, d1, white_queen_side},
+		castling_info{e1, g1, f1, h1, f1, white_king_side},
+		castling_info{e8, c8, d8, a8, d8, black_queen_side},
+		castling_info{e8, g8, f8, h8, f8, black_king_side}
+	};
+
+	#pragma endregion
 }

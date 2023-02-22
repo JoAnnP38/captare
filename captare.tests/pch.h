@@ -8,38 +8,57 @@
 #define PCH_H
 
 #include <CppUnitTestAssert.h>
+#include <CppUnitTestLogger.h>
 #include <string>
-#include "../captare/chesstypes.h"
-#include "../captare/move.h"
+#include "../captare/chess.h"
 
 namespace Microsoft {
 	namespace VisualStudio {
 		namespace CppUnitTestFramework {
 
 			template<>
-			static inline std::wstring ToString(const chess::color& color)
+			inline std::wstring ToString(const chess::color& color)
 			{
 				RETURN_WIDE_STRING(color);
 			}
 
 			template<>
-			static inline std::wstring ToString(const chess::piece& piece)
+			inline std::wstring ToString(const chess::piece& piece)
 			{
 				RETURN_WIDE_STRING(piece);
 			}
 
 			template<>
-			static inline std::wstring ToString(const chess::move_type& type)
+			inline std::wstring ToString(const chess::move_type& type)
 			{
 				RETURN_WIDE_STRING(type);
 			}
 
 			template<>
-			static inline std::wstring ToString(const chess::index& index)
+			inline std::wstring ToString(const chess::index& index)
 			{
 				RETURN_WIDE_STRING(index);
 			}
+
+			template<>
+			inline std::wstring ToString(const chess::castling_rights& castling)
+			{
+				RETURN_WIDE_STRING(castling);
+			}
 		}
+	}
+}
+
+namespace captaretests
+{
+	inline void WriteLine(std::string s)
+	{
+		Microsoft::VisualStudio::CppUnitTestFramework::Logger::WriteMessage(s.c_str());
+	}
+
+	inline void WriteLine()
+	{
+		Microsoft::VisualStudio::CppUnitTestFramework::Logger::WriteMessage("\n");
 	}
 }
 #endif //PCH_H

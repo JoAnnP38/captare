@@ -22,17 +22,17 @@ namespace captaretests
 			move move(pawn, e2, e4, dbl_pawn_move);
 
 			Assert::AreEqual(pawn, move.get_piece());
-			Assert::AreEqual(dbl_pawn_move, move.get_type());
-			Assert::AreEqual(e2, move.get_from());
-			Assert::AreEqual(e4, move.get_to());
-			Assert::AreEqual(piece_none, move.get_capture());
-			Assert::AreEqual(piece_none, move.get_promote());
+			Assert::AreEqual(dbl_pawn_move, move.type());
+			Assert::AreEqual(e2, move.from());
+			Assert::AreEqual(e4, move.to());
+			Assert::AreEqual(piece_none, move.capture());
+			Assert::AreEqual(piece_none, move.promote());
 		}
 
 		TEST_METHOD(get_value_test)
 		{
 			const move og(pawn, e2, e4, dbl_pawn_move);
-			move copy(og);
+			const move copy{ og };
 
 			Assert::AreEqual(og.get_value(), copy.get_value());
 		}
@@ -46,11 +46,11 @@ namespace captaretests
 			
 			Assert::AreEqual(og.get_value(), copy.get_value());
 			Assert::AreEqual(og.get_piece(), copy.get_piece());
-			Assert::AreEqual(og.get_type(), copy.get_type());
-			Assert::AreEqual(og.get_from(), copy.get_from());
-			Assert::AreEqual(og.get_to(), copy.get_to());
-			Assert::AreEqual(og.get_capture(), copy.get_capture());
-			Assert::AreEqual(og.get_promote(), copy.get_promote());
+			Assert::AreEqual(og.type(), copy.type());
+			Assert::AreEqual(og.from(), copy.from());
+			Assert::AreEqual(og.to(), copy.to());
+			Assert::AreEqual(og.capture(), copy.capture());
+			Assert::AreEqual(og.promote(), copy.promote());
 		}
 
 	};

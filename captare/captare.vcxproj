@@ -133,16 +133,26 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="captare.cpp" />
+    <ClCompile Include="notation.cpp" />
     <ClCompile Include="globals.cpp" />
     <ClCompile Include="move.cpp" />
+    <ClCompile Include="perft.cpp" />
     <ClCompile Include="position.cpp" />
     <ClCompile Include="square.cpp" />
+    <ClCompile Include="zobrist_hash.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="bitops.h" />
+    <ClInclude Include="chess.h" />
+    <ClInclude Include="move_vector.h" />
+    <ClInclude Include="object_pool.h" />
+    <ClInclude Include="notation.h" />
+    <ClInclude Include="perft.h" />
     <ClInclude Include="position.h" />
     <ClInclude Include="chesstypes.h" />
     <ClInclude Include="move.h" />
     <ClInclude Include="square.h" />
+    <ClInclude Include="zobrist_hash.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
