@@ -112,4 +112,5 @@ namespace chess
 	extern std::string trim_string(const std::string& str);
 	extern std::vector<std::string> split_string(const std::string& str);
 	extern std::string lowercase_string(const std::string& str);
+	template <typename T> int sign(T val) { return (T(0) < val) - (val < T(0)); }
 }

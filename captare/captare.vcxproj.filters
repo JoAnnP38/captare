@@ -39,6 +39,12 @@
     <ClCompile Include="perft.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="chess_weights.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="transposition_table.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="chesstypes.h">
@@ -74,5 +80,22 @@
     <ClInclude Include="perft.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="chess_weights.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="resource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="transposition_table.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="captare.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

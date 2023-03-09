@@ -9,4 +9,5 @@
 #include "object_pool.h"
 #include "move_vector.h"
 #include "perft.h"
+#include "transposition_table.h"
 

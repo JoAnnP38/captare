@@ -30,8 +30,8 @@ namespace chess
 
 		static uint64_t get_piece_hash(color c, piece p, index i)
 		{
-			const int pieceKind = p << 1 | (c ^ 1);
-			return random64_piece[static_cast<int64_t>(pieceKind << 6) + i];
+			const size_t pieceKind = p << 1 | (c ^ 1);
+			return random64_piece[(pieceKind << 6) + i];
 		}
 
 		static uint64_t get_castle_hash(castling_rights castle)
